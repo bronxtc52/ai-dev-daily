@@ -1,0 +1,18 @@
+# Секреты и локальная инфра-карта
+.env
+*.local.md
+
+# Выход прогонов (регенерируется)
+data/candidates*.json
+data/pimenov-sitemap.json
+data/sent_history.json
+research/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Syncthing / macOS
+.stfolder/
+.DS_Store
