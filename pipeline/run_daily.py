@@ -7,6 +7,7 @@
 - намерение отправить пишется до отправки, чтобы падение не дало дубль утром.
 """
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import html
@@ -25,7 +26,7 @@ from collect import collect_candidates
 import config
 from config import secret
 from curate import MIN_BLOCKS, curate as curate_digest
-from dedup import History, canonical_url
+from dedup import History, _atomic_write_json, canonical_url
 from formatting import build_post, render_digest
 
 # Пути резолвятся от файла, а не от cwd: под cron рабочая директория чужая,
@@ -36,6 +37,7 @@ LOCK_PATH = DATA_DIR / "run.lock"
 LOG_PATH = REPO_ROOT / "logs" / "run_daily.log"
 
 MAX_RUNTIME_SECONDS = 600       # потолок прогона; лежащий дольше lock считаем протухшим
+LOCK_BUSY_CODE = 2              # код возврата «работает другой прогон»
 
 log = logging.getLogger("run_daily")
 
@@ -174,6 +176,150 @@ class SecretRedactingFilter(logging.Filter):
             record.msg = "[запись лога вычищена: ошибка санитайзера]"
             record.args = ()
         return True
+
+
+# ---------- heartbeat --------------------------------------------------------
+#
+# След прогона для ВНЕШНЕГО монитора (server-watchdog). Собственный алёрт сервиса
+# ловит только упавший процесс; отсутствие процесса — cron не сработал, venv
+# сломался, identity потеряла доступ — послать алёрт некому. Файл отвечает на
+# вопрос, на который изнутри ответить нельзя: «прогон вообще состоялся?».
+#
+# Пишем на ЗАВЕРШЕНИЕ и только в боевом режиме: dry-run обновлял бы отметку
+# свежести, и ручная отладка вечером маскировала бы пропущенное утро.
+
+# Момент завершения прогона, снятый ПОКА ДЕРЖИМ lock. Именно lock задаёт порядок
+# завершений, поэтому штамп, снятый после его освобождения, этот порядок не отражает:
+# вытесненный с CPU прогон очнулся бы позже чужой записи, получил бы более поздний
+# штамп и на законных основаниях затёр более свежий исход.
+_LAST_COMPLETION = {}
+
+HEARTBEAT_NAME = "heartbeat.json"
+SERVICE_NAME = "ai-dev-daily"    # подпись отметки: чужой JSON не сойдёт за нашу
+MAX_REASON_CHARS = 500          # причина — для человека в алёрте, не лог целиком
+
+
+def heartbeat_path():
+    """Абсолютный путь к отметке. Считается на вызове: DATA_DIR подменяют тесты."""
+    return pathlib.Path(DATA_DIR) / HEARTBEAT_NAME
+
+
+HEARTBEAT_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+HEARTBEAT_LOCK_ATTEMPTS = 20        # ~0.2 c суммарно: дольше ждать нечего, файл крошечный
+HEARTBEAT_STATUSES = ("success", "failure")
+
+
+def _parse_heartbeat_time(value):
+    """Время из отметки как datetime; None — если это не наше время."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return dt.datetime.strptime(value, HEARTBEAT_TIME_FORMAT).replace(
+            tzinfo=dt.timezone.utc)
+    except ValueError:
+        try:                                        # отметки прежнего формата, без долей
+            return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=dt.timezone.utc)
+        except ValueError:
+            return None
+
+
+def _existing_heartbeat_is_newer(finished_at):
+    """Лежит ли на месте ВАЛИДНАЯ отметка более позднего прогона.
+
+    Сравнивать сырые строки нельзя: `{"finished_at": "z"}` лексикографически
+    больше любой даты, и одна такая запись запретила бы обновление НАВСЕГДА —
+    сторож остался бы в ошибке навечно. Залипание хуже гонки, от которой
+    защищаемся, поэтому «сохраняем чужое» только если чужое — действительно
+    наша отметка: своё имя сервиса, известный статус, разбираемое время.
+    """
+    try:
+        current = json.loads(heartbeat_path().read_text(encoding="utf-8"))
+    except Exception:                               # noqa: BLE001
+        return False                                # нет файла или мусор — пишем поверх
+    if not isinstance(current, dict):
+        return False
+    if current.get("service") != SERVICE_NAME:
+        return False
+    if current.get("status") not in HEARTBEAT_STATUSES:
+        return False
+    theirs = _parse_heartbeat_time(current.get("finished_at"))
+    ours = _parse_heartbeat_time(finished_at)
+    if theirs is None or ours is None:
+        return False
+    return theirs > ours
+
+
+@contextlib.contextmanager
+def _heartbeat_write_lock():
+    """Сериализовать «прочитать-сравнить-записать».
+
+    Проверка и запись — две операции, между ними другой прогон успевает
+    записаться, и мы затираем его результат уже после сравнения. Лок
+    best-effort: не досталась — всё равно пишем (тишина монитора дороже
+    редкой гонки), но большинство наложений он разводит.
+    """
+    lock = heartbeat_path().with_name(HEARTBEAT_NAME + ".lock")
+    fd = None
+    for _ in range(HEARTBEAT_LOCK_ATTEMPTS):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            time.sleep(0.01)
+        except OSError:
+            break                                   # каталог недоступен — не наша беда
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
+
+
+def write_heartbeat(status, now=None, reason=None):
+    """Оставить отметку о завершении прогона. Никогда не поднимает исключение.
+
+    Служебная запись не имеет права стоить дайджеста: любая ошибка здесь —
+    предупреждение в лог, а не падение прогона.
+    """
+    try:
+        now = now or dt.datetime.now(dt.timezone.utc)
+        payload = {
+            # Отметка называет себя: монитор с опечаткой в пути иначе может
+            # набрести на чужой валидный JSON со `status` внутри и замолчать
+            # навсегда, выглядя при этом исправным.
+            "service": SERVICE_NAME,
+            "status": status,
+            # Возраст монитор считает по ЭТОМУ полю, а не по mtime файла: mtime
+            # переживает cp -p и rsync, то есть врёт при переносе состояния.
+            # Доли секунды обязательны: два прогона в одной секунде иначе
+            # неразличимы по времени, и порядок завершений теряется.
+            "finished_at": now.astimezone(dt.timezone.utc)
+                              .strftime(HEARTBEAT_TIME_FORMAT),
+            "digest_date": now.date().isoformat(),
+        }
+        if reason:
+            # Тот же санитайзер, что у алёрта: в тексте исключения от провайдера
+            # легко оказывается URL с ключом в query.
+            payload["reason"] = sanitize_alert(str(reason))[:MAX_REASON_CHARS]
+
+        # Запись идёт уже ПОСЛЕ освобождения lock, поэтому порядок записи может
+        # разойтись с порядком завершения: вытесненный с CPU провалившийся прогон
+        # очнётся и затрёт успех более позднего ретрая. Сторож поднял бы тревогу
+        # по несуществующей поломке, а причину искали бы в сервисе. Отметка обязана
+        # представлять последний ЗАВЕРШИВШИЙСЯ прогон, поэтому старую не откатываем.
+        with _heartbeat_write_lock():
+            if _existing_heartbeat_is_newer(payload["finished_at"]):
+                log.info("heartbeat не тронут: на месте отметка более позднего прогона")
+                return
+            _atomic_write_json(heartbeat_path(), payload)
+    except Exception as e:                          # noqa: BLE001
+        log.warning("не удалось записать heartbeat (%s) — прогон это не ломает",
+                    type(e).__name__)
 
 
 # ---------- блокировка -------------------------------------------------------
@@ -339,7 +485,7 @@ def run(now=None, force=False, dry_run=False):
     # DATA_DIR и тесты не пишут в рабочий репозиторий.
     lock_path = data_dir / "run.lock"
     if not acquire_lock(now, path=lock_path):
-        return 2
+        return LOCK_BUSY_CODE
 
     try:
         history = History(data_dir / "sent_history.json")
@@ -442,6 +588,9 @@ def run(now=None, force=False, dry_run=False):
                  len(digest["blocks"]), resp.get("message_id"))
         return 0
     finally:
+        # Штамп — до освобождения lock: пока он наш, ни один другой прогон не мог
+        # завершиться, значит порядок штампов совпадает с порядком завершений.
+        _LAST_COMPLETION["at"] = dt.datetime.now(dt.timezone.utc)
         release_lock(lock_path)
 
 
@@ -474,8 +623,18 @@ def main(argv=None):
         now = now.replace(tzinfo=dt.timezone.utc)   # naive-отметки портят журнал
 
     try:
-        return run(now=now, force=args.force, dry_run=args.dry_run)
+        rc = run(now=now, force=args.force, dry_run=args.dry_run)
     except Exception as e:                          # noqa: BLE001
+        # Штамп берём тот, что снят под lock'ом внутри run(). Свой здесь снимать
+        # нельзя: между освобождением lock и этой строкой чужой прогон мог успеть
+        # завершиться и записаться, а более поздний штамп дал бы нам право его
+        # затереть — ровно тот откат, от которого защищаемся.
+        finished = _LAST_COMPLETION.get("at") or dt.datetime.now(dt.timezone.utc)
+        # Heartbeat — ПЕРВЫМ делом: всё остальное в этой ветке ходит по сети
+        # (Sentry, алёрт) и может не дойти, а исход прогона потерять нельзя.
+        if not args.dry_run:
+            write_heartbeat("failure", now=now or finished,
+                            reason=f"{type(e).__name__}: {e}")
         log.exception("прогон упал")
         try:
             import sentry_sdk
@@ -488,6 +647,17 @@ def main(argv=None):
         # когда уведомление нужнее всего.
         _try_alert(f"⚠️ Дайджест не отправлен.\n{type(e).__name__}: {e}")
         return 1
+
+    # Провал без исключения — это тоже провал: `run` возвращает 1 (в пост влезло
+    # меньше минимума блоков) и 3 (неразрешённое намерение), и оба означают, что
+    # утром поста не будет. Код 2 пропускаем осознанно: он значит «работает ДРУГОЙ
+    # прогон», чужой исход этому процессу неизвестен, а свой ещё не наступил.
+    finished = _LAST_COMPLETION.get("at") or dt.datetime.now(dt.timezone.utc)
+    if not args.dry_run and rc != LOCK_BUSY_CODE:
+        write_heartbeat(
+            "success" if rc == 0 else "failure", now=now or finished,
+            reason=None if rc == 0 else f"прогон завершился кодом {rc}")
+    return rc
 
 
 if __name__ == "__main__":
