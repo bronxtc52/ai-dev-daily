@@ -54,7 +54,7 @@ path, errors }` + поле в `ServerReport` + три поля в `RuntimeConfig
 
 **B2. `src/config.ts`.** `aiDevDailyEnabled` (`=== 'true'`, деф. false),
 `aiDevDailyHeartbeatPath` (деф. `/home/azureuser/projects/ai-dev-daily/data/heartbeat.json`),
-`aiDevDailyMaxAgeHours` (`parseNonNegativeNumber`, деф. 26).
+`aiDevDailyMaxAgeHours` (`parseNonNegativeNumber`, деф. **24** — арифметика в ТЗ).
 
 **B3. `src/collectors/aiDevDailyHeartbeat.ts`.** Синхронный `readFileSync` + `JSON.parse`
 в `try/catch`. Возраст считаем **по `finished_at` из тела**, а не по mtime файла: mtime
@@ -80,7 +80,7 @@ path, errors }` + поле в `ServerReport` + три поля в `RuntimeConfig
 + условный attach в отчёт (выключенный чек поля не кладёт — критерий 12).
 
 **B6. `src/collectors/CLAUDE.md`.** Абзац по конвенции репо: что ловим, почему по
-`finished_at` а не mtime, почему 26 ч, почему без чисел в тексте, флаги, notify-only.
+`finished_at` а не mtime, почему 24 ч, почему без чисел в тексте, флаги, notify-only.
 
 ## Тесты (Шаг 3, red-first)
 
@@ -154,5 +154,5 @@ path, errors }` + поле в `ServerReport` + три поля в `RuntimeConfig
   `tsc --noEmit` + полный прогон тестов репо до PR.
 - **Ложная тишина.** Все неопределённости (битый файл, чужой статус, нечитаемое время)
   ведут к алёрту, а не к молчанию.
-- **Ложный шум.** Порог 26 ч + отсутствие чисел в тексте + kill-switch.
+- **Ложный шум.** Порог 24 ч + отсутствие чисел в тексте + kill-switch.
 - **Не покрыто (осознанно):** мёртвый хост целиком. Остаётся в issue #2 с новым триггером.
