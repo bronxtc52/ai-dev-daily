@@ -152,4 +152,20 @@ class History:
             "sent_at": stamp,
         }
         self._data.pop("pending", None)     # исход известен — намерение разрешено
+        self._prune(now)
         _atomic_write_json(self.path, self._data)
+
+    def _prune(self, now, window_days=WINDOW_DAYS):
+        """Выбросить записи вне окна дедупа: иначе журнал растёт бесконечно."""
+        edge = now - dt.timedelta(days=window_days)
+        kept = []
+        for e in self._data.get("entries", []):
+            try:
+                sent_at = dt.datetime.fromisoformat(e["sent_at"])
+                if sent_at.tzinfo is None:
+                    sent_at = sent_at.replace(tzinfo=dt.timezone.utc)
+                if sent_at >= edge:
+                    kept.append(e)
+            except (KeyError, ValueError, TypeError):
+                continue                    # битую запись не тащим дальше
+        self._data["entries"] = kept

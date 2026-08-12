@@ -371,3 +371,105 @@ def test_build_post_respects_limit_after_closing_tags():
     huge = "<b>" + "я" * 8000
     post = build_post([huge])
     assert tg_length(post) <= 4096
+
+
+# --- Scope ТЗ §2: критерии отбора и голос берутся из файлов проекта ----------
+
+def test_prompt_uses_project_criteria_file():
+    """Критерии отбора должны браться из prompt.md, а не дублироваться в коде."""
+    prompt = curate.build_prompt([{"source": "X", "title": "t",
+                                   "url": "https://example.com/a"}])
+    # Якорь из prompt.md: анти-фильтр — то, чего нет в инлайн-тексте промпта.
+    assert "Анти-фильтр" in prompt or "анти-фильтр" in prompt.lower(), \
+        "критерии из prompt.md не попали в промпт курации"
+
+
+def test_prompt_uses_style_guide():
+    prompt = curate.build_prompt([{"source": "X", "title": "t",
+                                   "url": "https://example.com/a"}])
+    assert "Без пафоса" in prompt or "без пафоса" in prompt.lower(), \
+        "голос из arman_style.md не попал в промпт курации"
+
+
+def test_project_docs_are_read_from_disk(monkeypatch, tmp_path):
+    """Промпт обязан меняться вслед за файлом, а не быть копией в коде."""
+    marker = "УНИКАЛЬНЫЙ-МАРКЕР-КРИТЕРИЕВ-42"
+    fake = tmp_path / "prompt.md"
+    fake.write_text(f"# Критерии\n{marker}\n")
+    monkeypatch.setattr(curate, "PROMPT_PATH", fake)
+    curate.load_project_docs.cache_clear()
+
+    prompt = curate.build_prompt([{"source": "X", "title": "t",
+                                   "url": "https://example.com/a"}])
+    curate.load_project_docs.cache_clear()
+
+    assert marker in prompt, "файл критериев не читается с диска"
+
+
+def test_invalid_json_retry_tells_model_what_broke():
+    """Повтор с тем же промптом бессмысленен: модель должна узнать об ошибке."""
+    seen = []
+
+    def bad_then_good(prompt):
+        seen.append(prompt)
+        if len(seen) == 1:
+            raise ValueError("в ответе модели нет JSON-объекта")
+        return _digest()
+
+    orig_pplx, orig_claude = curate.ask_perplexity, curate.ask_claude
+    curate.ask_perplexity, curate.ask_claude = (lambda *a, **k: []), bad_then_good
+    try:
+        curate.curate([{"url": "https://example.com/a", "title": "t"}])
+    finally:
+        curate.ask_perplexity, curate.ask_claude = orig_pplx, orig_claude
+
+    assert len(seen) == 2
+    assert seen[1] != seen[0], "второй промпт идентичен первому"
+    assert "JSON" in seen[1], "модели не сказали, что именно сломалось"
+
+
+def test_radar_item_without_url_does_not_fail_validation():
+    """Необязательная секция не должна стоить утреннего поста."""
+    digest = _digest(3, radar=[{"title": "без ссылки", "note": "n"},
+                               {"title": "ок", "url": "https://example.com/r",
+                                "note": "n"}])
+    curate.validate_digest(digest)              # не должно бросать
+    assert len(digest["radar"]) == 1, "дефектный пункт радара должен отсеяться"
+
+
+def test_top_level_alert_is_retried(monkeypatch, tmp_path):
+    """Главный обработчик падения обязан повторять доставку алёрта."""
+    calls = {"n": 0}
+
+    def flaky_alert(text, **k):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise ConnectionError("сеть моргнула")
+
+    monkeypatch.setattr(run_daily, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(run_daily, "LOG_PATH", tmp_path / "run.log")
+    monkeypatch.setattr(run_daily, "LOCK_PATH", tmp_path / "run.lock")
+    monkeypatch.setattr(run_daily, "send_alert", flaky_alert)
+    monkeypatch.setattr(run_daily.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(run_daily, "collect_candidates",
+                        lambda **k: (_ for _ in ()).throw(RuntimeError("сбор упал")))
+
+    code = run_daily.main(["--now", NOW.isoformat()])
+
+    assert code != 0
+    assert calls["n"] == 3, "алёрт верхнего уровня ушёл одной попыткой и потерялся"
+
+
+def test_history_entries_do_not_grow_forever(tmp_path):
+    """Журнал не должен пухнуть бесконечно: записи вне окна не нужны."""
+    path = tmp_path / "sent.json"
+    h = History(path)
+    h.record_sent(["https://example.com/old"], message_id=1, digest_hash="h",
+                  now=NOW - dt.timedelta(days=120))
+    h.record_sent(["https://example.com/new"], message_id=2, digest_hash="h",
+                  now=NOW)
+
+    entries = json.loads(path.read_text())["entries"]
+
+    assert len(entries) == 1, "записи старше окна дедупа должны вычищаться"
+    assert entries[0]["url"] == "https://example.com/new"

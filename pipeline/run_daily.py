@@ -401,12 +401,10 @@ def main(argv=None):
         return run(now=now, force=args.force, dry_run=args.dry_run)
     except Exception as e:                          # noqa: BLE001
         log.exception("прогон упал")
-        try:
-            send_alert(sanitize_alert(
-                f"⚠️ Дайджест не отправлен.\n{type(e).__name__}: {e}"))
-        except Exception:                           # noqa: BLE001
-            # Алёрт — best-effort: его падение не должно маскировать исходную ошибку.
-            log.error("не удалось доставить алёрт о сбое")
+        # Через _try_alert, а не одним вызовом: падение прогона чаще всего
+        # вызвано сетью, и одиночная попытка потерялась бы ровно тогда,
+        # когда уведомление нужнее всего.
+        _try_alert(f"⚠️ Дайджест не отправлен.\n{type(e).__name__}: {e}")
         return 1
 
 
