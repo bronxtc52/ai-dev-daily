@@ -6,6 +6,7 @@
 изнутри: иначе достаточно твита «ignore all previous instructions», чтобы
 подменить утренний дайджест.
 """
+import datetime as dt
 import functools
 import json
 import logging
@@ -42,6 +43,14 @@ PERPLEXITY_QUERIES = [
 ]
 
 
+def _parse_date(value):
+    """Дата публикации из ответа провайдера; None, если формат неожиданный."""
+    try:
+        return dt.date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
 def _post_json(url, payload, headers, timeout=HTTP_TIMEOUT):
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(), headers=headers)
@@ -51,7 +60,7 @@ def _post_json(url, payload, headers, timeout=HTTP_TIMEOUT):
 
 # ---------- внешние вызовы (мокаются в тестах) -------------------------------
 
-def ask_perplexity(queries=None):
+def ask_perplexity(queries=None, now=None, window_days=3):
     """Добрать свежие материалы. Возвращает список кандидатов.
 
     Берём search_results, а не citations: там есть title/date/snippet, а в
@@ -68,7 +77,14 @@ def ask_perplexity(queries=None):
              "search_recency_filter": "week"},
             {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}))
 
+        edge = ((now or dt.datetime.now(dt.timezone.utc))
+                - dt.timedelta(days=window_days)).date()
         for r in data.get("search_results", []) or []:
+            # Recency-фильтр API умеет только «неделю», а окно сервиса — 3 дня:
+            # без локальной проверки в дайджест попадал бы материал недельной давности.
+            published = _parse_date(r.get("date"))
+            if published and published < edge:
+                continue
             out.append({"source": "Perplexity", "title": r.get("title"),
                         "url": r.get("url"), "date": r.get("date"),
                         "extra": {"snippet": (r.get("snippet") or "")[:200]}})
@@ -239,8 +255,13 @@ def build_prompt(candidates, style_hint="", error_hint=""):
 
 # ---------- валидация --------------------------------------------------------
 
-def validate_digest(digest):
-    """Смоук-проверка состава дайджеста. Бросает ValueError при несоответствии."""
+def validate_digest(digest, allowed_urls=None):
+    """Смоук-проверка состава дайджеста. Бросает ValueError при несоответствии.
+
+    allowed_urls — канонические URL кандидатов. Синтаксически валидная ссылка
+    ещё не значит настоящая: модель недетерминирована и может выдать выдуманный
+    или подменённый источник, а читателю он уедет как курированный.
+    """
     if not isinstance(digest, dict):
         raise ValueError("дайджест не является объектом")
 
@@ -259,15 +280,26 @@ def validate_digest(digest):
             raise ValueError(f"блок {i}: недопустимая схема URL {b['url']!r}")
         if not urlsplit(b["url"]).netloc:
             raise ValueError(f"блок {i}: URL без домена {b['url']!r}")
+        if allowed_urls is not None:
+            from dedup import canonical_url
+            if canonical_url(b["url"]) not in allowed_urls:
+                raise ValueError(
+                    f"блок {i}: URL {b['url']!r} не встречался среди кандидатов")
 
     # Радар необязателен: дефектный пункт отбрасываем, но не теряем из-за него
     # весь утренний пост.
     good_radar = []
     for r in digest.get("radar") or []:
-        if urlsplit(r.get("url", "")).scheme in ("http", "https"):
-            good_radar.append(r)
-        else:
-            log.warning("радар: пункт с недопустимым URL %r отброшен", r.get("url"))
+        url = r.get("url", "")
+        if urlsplit(url).scheme not in ("http", "https"):
+            log.warning("радар: пункт с недопустимым URL %r отброшен", url)
+            continue
+        if allowed_urls is not None:
+            from dedup import canonical_url
+            if canonical_url(url) not in allowed_urls:
+                log.warning("радар: URL %r не из кандидатов — отброшен", url)
+                continue
+        good_radar.append(r)
     if "radar" in digest:
         digest["radar"] = good_radar
 
@@ -276,7 +308,7 @@ def validate_digest(digest):
 
 # ---------- оркестрация курации ---------------------------------------------
 
-def curate(candidates, style_hint="", seen_urls=None):
+def curate(candidates, style_hint="", seen_urls=None, now=None):
     """Отобрать материалы и получить готовые тексты блоков.
 
     Отказ Perplexity — деградация (утренний пост важнее полноты).
@@ -291,7 +323,7 @@ def curate(candidates, style_hint="", seen_urls=None):
     enriched = list(candidates)
 
     try:
-        enriched += ask_perplexity()
+        enriched += ask_perplexity(now=now)
     except Exception as e:                          # noqa: BLE001
         degraded = True
         log.warning("Perplexity недоступен (%s) — курируем на своих кандидатах",
@@ -302,6 +334,8 @@ def curate(candidates, style_hint="", seen_urls=None):
         enriched = [c for c in enriched
                     if c.get("url") and canonical_url(c["url"]) not in seen_urls]
         log.info("дедуп после добора: %d → %d кандидатов", before, len(enriched))
+
+    allowed = {canonical_url(c["url"]) for c in enriched if c.get("url")}
 
     if not enriched:
         # Пустой список — прямая дорога к галлюцинации: промпт требует 3-6 блоков,
@@ -314,7 +348,7 @@ def curate(candidates, style_hint="", seen_urls=None):
                               error_hint=str(last_error) if last_error else "")
         try:
             digest = ask_claude(prompt)
-            validate_digest(digest)
+            validate_digest(digest, allowed_urls=allowed)
             digest["degraded"] = degraded
             return digest
         except (ValueError, json.JSONDecodeError) as e:

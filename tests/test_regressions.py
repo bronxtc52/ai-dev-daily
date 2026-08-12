@@ -49,7 +49,8 @@ def test_perplexity_material_already_sent_is_filtered(tmp_path):
     orig_pplx, orig_claude = curate.ask_perplexity, curate.ask_claude
     curate.ask_perplexity, curate.ask_claude = fake_pplx, fake_claude
     try:
-        curate.curate([{"url": "https://example.com/new", "title": "свежий"}],
+        curate.curate([{"url": f"https://example.com/{i}", "title": "свежий"}
+                       for i in range(4)],
                       seen_urls=hist.seen_urls(NOW))
     finally:
         curate.ask_perplexity, curate.ask_claude = orig_pplx, orig_claude
@@ -321,7 +322,9 @@ def test_urls_cut_by_limit_are_not_recorded_as_sent(tmp_path, monkeypatch):
     monkeypatch.setattr(run_daily, "LOCK_PATH", tmp_path / "run.lock")
     monkeypatch.setattr(run_daily, "send_alert", lambda *a, **k: None)
 
-    long_benefit = "Что вам это даёт: " + "очень длинное объяснение. " * 120
+    # Блоки такого размера, чтобы в лимит влезло 3-4 из 6: меньше MIN_BLOCKS
+    # пост бы вообще не ушёл, и проверять было бы нечего.
+    long_benefit = "Что вам это даёт: " + "объяснение. " * 75
     digest = {"blocks": [{"emoji": "🏗", "title": f"Материал {i}",
                           "url": f"https://example.com/{i}",
                           "benefit": long_benefit} for i in range(6)],
@@ -419,7 +422,8 @@ def test_invalid_json_retry_tells_model_what_broke():
     orig_pplx, orig_claude = curate.ask_perplexity, curate.ask_claude
     curate.ask_perplexity, curate.ask_claude = (lambda *a, **k: []), bad_then_good
     try:
-        curate.curate([{"url": "https://example.com/a", "title": "t"}])
+        curate.curate([{"url": f"https://example.com/{i}", "title": "t"}
+                       for i in range(4)])
     finally:
         curate.ask_perplexity, curate.ask_claude = orig_pplx, orig_claude
 
@@ -516,3 +520,115 @@ def test_empty_model_answer_is_reported_clearly(monkeypatch):
 
     with pytest.raises(ValueError, match="пустой ответ"):
         curate.ask_claude("промпт")
+
+
+# --- Находки Codex на PR #1 --------------------------------------------------
+
+def test_post_truncated_below_minimum_is_not_sent(tmp_path, monkeypatch):
+    """Усечение может оставить в посте меньше блоков, чем требует смоук."""
+    monkeypatch.setattr(run_daily, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(run_daily, "LOCK_PATH", tmp_path / "run.lock")
+    monkeypatch.setattr(run_daily, "send_alert", lambda *a, **k: None)
+
+    # Каждый блок почти во весь лимит: в пост влезет один, а прошло валидацию 4.
+    huge = "Что вам это даёт: " + "длинное объяснение. " * 190
+    digest = {"blocks": [{"emoji": "🏗", "title": f"Материал {i}",
+                          "url": f"https://example.com/{i}", "benefit": huge}
+                         for i in range(4)],
+              "radar": [], "degraded": False}
+
+    sent = []
+    monkeypatch.setattr(run_daily, "collect_candidates",
+                        lambda **k: [{"url": "https://example.com/src", "title": "t"}])
+    monkeypatch.setattr(run_daily, "curate_digest", lambda *a, **k: digest)
+    monkeypatch.setattr(run_daily, "send_telegram",
+                        lambda text, **k: sent.append(text) or {"message_id": 1})
+
+    code = run_daily.run(now=NOW)
+
+    assert sent == [], "ушёл пост, где меньше материалов, чем требует смоук"
+    assert code != 0
+
+
+def test_hallucinated_url_is_rejected():
+    """URL, которого не было среди кандидатов, публиковать нельзя."""
+    candidates = [{"url": "https://real.example.com/a", "title": "настоящий"}]
+
+    def fake_claude(prompt):
+        return {"blocks": [{"emoji": "🏗", "title": f"Материал {i}",
+                            "url": "https://invented.example.com/fake",
+                            "benefit": "Что вам это даёт: польза."} for i in range(3)],
+                "radar": []}
+
+    orig_pplx, orig_claude = curate.ask_perplexity, curate.ask_claude
+    curate.ask_perplexity, curate.ask_claude = (lambda *a, **k: []), fake_claude
+    try:
+        with pytest.raises(Exception):
+            curate.curate(candidates)
+    finally:
+        curate.ask_perplexity, curate.ask_claude = orig_pplx, orig_claude
+
+
+def test_real_candidate_url_passes_even_in_other_form():
+    """Сверка идёт по канонической форме, а не по точному совпадению строк."""
+    candidates = [{"url": "https://real.example.com/a?utm_source=x", "title": "t"},
+                  {"url": "https://real.example.com/b", "title": "t2"},
+                  {"url": "https://real.example.com/c", "title": "t3"}]
+
+    def fake_claude(prompt):
+        return {"blocks": [{"emoji": "🏗", "title": "М",
+                            "url": u, "benefit": "Что вам это даёт: польза."}
+                           for u in ("http://www.real.example.com/a/",
+                                     "https://real.example.com/b",
+                                     "https://real.example.com/c")],
+                "radar": []}
+
+    orig_pplx, orig_claude = curate.ask_perplexity, curate.ask_claude
+    curate.ask_perplexity, curate.ask_claude = (lambda *a, **k: []), fake_claude
+    try:
+        digest = curate.curate(candidates)
+    finally:
+        curate.ask_perplexity, curate.ask_claude = orig_pplx, orig_claude
+
+    assert len(digest["blocks"]) == 3
+
+
+def test_pending_cleared_when_delivery_definitely_failed(tmp_path, monkeypatch):
+    """DNS-сбой означает «не доставлено» — блокировать повтор незачем."""
+    import socket
+    import urllib.error
+
+    monkeypatch.setattr(run_daily, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(run_daily, "LOCK_PATH", tmp_path / "run.lock")
+    monkeypatch.setattr(run_daily, "send_alert", lambda *a, **k: None)
+    monkeypatch.setattr(run_daily.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(run_daily, "collect_candidates",
+                        lambda **k: [{"url": "https://example.com/src", "title": "t"}])
+    monkeypatch.setattr(run_daily, "curate_digest", lambda *a, **k: _digest(4))
+    monkeypatch.setattr(run_daily, "send_telegram", lambda *a, **k: (_ for _ in ()).throw(
+        urllib.error.URLError(socket.gaierror("DNS не ответил"))))
+
+    with pytest.raises(Exception):
+        run_daily.run(now=NOW)
+
+    hist = History(tmp_path / "sent_history.json")
+    assert hist.has_pending_today(NOW) is False, \
+        "намерение осталось, хотя сообщение заведомо не ушло — повтор заблокирован зря"
+
+
+def test_perplexity_results_outside_window_are_dropped(monkeypatch):
+    """Perplexity фильтрует по неделе, а окно сервиса — 3 дня."""
+    monkeypatch.setattr(curate, "secret", lambda k: "fake")
+    monkeypatch.setattr(curate, "_post_json", lambda *a, **k: {
+        "search_results": [
+            {"title": "свежий", "url": "https://example.com/fresh",
+             "date": "2026-08-11", "snippet": "s"},
+            {"title": "недельной давности", "url": "https://example.com/old",
+             "date": "2026-08-04", "snippet": "s"},
+        ], "usage": {}})
+
+    got = curate.ask_perplexity(queries=["q"], now=NOW, window_days=3)
+
+    urls = [c["url"] for c in got]
+    assert "https://example.com/fresh" in urls
+    assert "https://example.com/old" not in urls, "материал вне окна свежести доехал"

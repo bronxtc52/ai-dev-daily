@@ -313,7 +313,7 @@ def run(now=None, force=False, dry_run=False):
 
         # seen передаём внутрь: Perplexity добирает материалы уже после этого
         # фильтра, и без второй проверки они минуют дедуп целиком.
-        digest = curate_digest(fresh, seen_urls=seen)
+        digest = curate_digest(fresh, seen_urls=seen, now=now)
 
         # Страховка на случай, если модель всё-таки вернула отправленное раньше.
         kept = [b for b in digest.get("blocks", [])
@@ -347,6 +347,19 @@ def run(now=None, force=False, dry_run=False):
         if len(urls) != len(candidate_urls):
             log.warning("%d материалов не влезли в лимит и в историю не пишутся",
                         len(candidate_urls) - len(urls))
+
+        # Смоук 3-6 блоков считался ДО сборки поста. Усечение по лимиту может
+        # оставить в тексте меньше: тогда читателю уехал бы куцый дайджест,
+        # а история пометила бы день отправленным.
+        in_post = [b for b in digest["blocks"]
+                   if html.escape(b["url"], quote=True) in post]
+        if len(in_post) < MIN_BLOCKS:
+            log.error("в пост влезло %d блоков из %d (нужно от %d) — не отправляем",
+                      len(in_post), len(digest["blocks"]), MIN_BLOCKS)
+            _try_alert(f"⚠️ Дайджест сегодня не отправлен: после усечения по лимиту "
+                       f"в посте осталось {len(in_post)} материалов при минимуме "
+                       f"{MIN_BLOCKS}. Вероятно, модель выдала слишком длинные тексты.")
+            return 1
         digest_hash = hashlib.sha256(post.encode()).hexdigest()[:16]
 
         (data_dir / f"digest-{now.date().isoformat()}.json").write_text(
@@ -360,7 +373,16 @@ def run(now=None, force=False, dry_run=False):
         # Намерение фиксируем ДО отправки: если процесс погибнет между вызовом
         # Telegram и записью результата, завтрашний прогон об этом узнает.
         history.record_intent(digest_hash, now)
-        resp = _send_once_or_safely_retry(post)
+        try:
+            resp = _send_once_or_safely_retry(post)
+        except Exception as e:                      # noqa: BLE001
+            if _is_definitely_not_delivered(e):
+                # Исход известен: сообщение не ушло. Держать намерение незачем —
+                # иначе повтор в тот же день молча упрётся в «исход неизвестен».
+                history.clear_intent()
+                log.warning("доставка заведомо не состоялась — намерение снято, "
+                            "повтор сегодня разрешён")
+            raise
         history.record_sent(urls, message_id=resp.get("message_id"),
                             digest_hash=digest_hash, now=now)
 

@@ -7,19 +7,26 @@ import pytest
 import curate
 
 
+# URL блоков обязаны встречаться среди кандидатов: модель не вправе приносить
+# ссылки со стороны, и валидация это проверяет.
 CANDIDATES = [
-    {"source": "X", "title": "Новый CLI-агент", "url": "https://example.com/a"},
-    {"source": "GitHub", "title": "Свежий MCP-сервер", "url": "https://example.com/b"},
-]
+    {"source": "X", "title": f"Материал {i}", "url": f"https://example.com/{i}"}
+    for i in range(4)
+] + [{"source": "GitHub", "title": "Радар", "url": "https://example.com/r"}]
 
-GOOD_DIGEST = {
-    "blocks": [
-        {"emoji": "🏗", "title": f"Материал {i}", "url": f"https://example.com/{i}",
-         "benefit": "Что вам это даёт: экономия времени."}
-        for i in range(4)
-    ],
-    "radar": [{"title": "Радар", "url": "https://example.com/r", "note": "коротко"}],
-}
+
+def _good_digest():
+    return {
+        "blocks": [
+            {"emoji": "🏗", "title": f"Материал {i}", "url": f"https://example.com/{i}",
+             "benefit": "Что вам это даёт: экономия времени."}
+            for i in range(4)
+        ],
+        "radar": [{"title": "Радар", "url": "https://example.com/r", "note": "коротко"}],
+    }
+
+
+GOOD_DIGEST = _good_digest()
 
 
 # --- Критерий 8: отказ Perplexity деградирует, но не роняет ------------------
@@ -27,7 +34,7 @@ GOOD_DIGEST = {
 def test_perplexity_failure_degrades_to_claude_only(monkeypatch):
     monkeypatch.setattr(curate, "ask_perplexity",
                         lambda *a, **k: (_ for _ in ()).throw(ConnectionError("нет сети")))
-    monkeypatch.setattr(curate, "ask_claude", lambda *a, **k: GOOD_DIGEST)
+    monkeypatch.setattr(curate, "ask_claude", lambda *a, **k: _good_digest())
 
     digest = curate.curate(CANDIDATES)
 
@@ -37,7 +44,7 @@ def test_perplexity_failure_degrades_to_claude_only(monkeypatch):
 def test_degradation_is_reported(monkeypatch):
     monkeypatch.setattr(curate, "ask_perplexity",
                         lambda *a, **k: (_ for _ in ()).throw(ConnectionError("нет сети")))
-    monkeypatch.setattr(curate, "ask_claude", lambda *a, **k: GOOD_DIGEST)
+    monkeypatch.setattr(curate, "ask_claude", lambda *a, **k: _good_digest())
 
     digest = curate.curate(CANDIDATES)
 
@@ -73,7 +80,7 @@ def test_invalid_json_from_claude_is_retried_then_raises(monkeypatch):
 # --- Критерий 15: смоук состава дайджеста ------------------------------------
 
 def test_validate_accepts_good_digest():
-    curate.validate_digest(GOOD_DIGEST)      # не должно бросать
+    curate.validate_digest(_good_digest())      # не должно бросать
 
 
 @pytest.mark.parametrize("count", [0, 1, 2, 7, 15])

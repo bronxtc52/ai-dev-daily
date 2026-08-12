@@ -136,6 +136,11 @@ class History:
         }
         _atomic_write_json(self.path, self._data)
 
+    def clear_intent(self):
+        """Снять намерение: исход отправки достоверно известен как неудачный."""
+        if self._data.pop("pending", None) is not None:
+            _atomic_write_json(self.path, self._data)
+
     def record_sent(self, urls, message_id, digest_hash, now):
         """Зафиксировать факт отправки.
 
