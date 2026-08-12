@@ -1,12 +1,17 @@
-# Секреты и локальная инфра-карта
+# Секреты, локальная инфра-карта и пакеты внешнего ревью
 .env
 *.local.md
+.review/
 
 # Выход прогонов (регенерируется)
 data/candidates*.json
 data/pimenov-sitemap.json
 data/sent_history.json
 research/
+logs/
+data/digest-*.json
+data/run.lock
+data/*.corrupt
 
 # Python
 .venv/

@@ -14,11 +14,22 @@ import subprocess
 
 VAULT = os.environ.get("KEYVAULT_NAME")
 
+# Реестр фактически выданных значений. Нужен, чтобы санитайзер логов и алёртов
+# знал, что именно вычищать: в проде секреты приходят из Key Vault, и в
+# os.environ их нет — маскировка «по окружению» там не сработала бы вовсе.
+_issued = {}
+
+
+def issued_secrets():
+    """Значения секретов, выданные за время работы процесса."""
+    return [v for v in _issued.values() if v]
+
 
 def secret(key):
     """Вернуть значение секрета по логическому имени key."""
     direct = os.environ.get(key)
     if direct:
+        _issued[key] = direct
         return direct
 
     name = os.environ.get(f"{key}_SECRET")
@@ -31,6 +42,11 @@ def secret(key):
             f"{key}_SECRET задан, но нет KEYVAULT_NAME — неизвестно, из какого "
             f"хранилища читать")
 
-    return subprocess.check_output(
+    value = subprocess.check_output(
         ["az", "keyvault", "secret", "show", "--vault-name", VAULT,
-         "--name", name, "--query", "value", "-o", "tsv"], text=True).strip()
+         "--name", name, "--query", "value", "-o", "tsv"],
+        # timeout обязателен: под cron нет интерактивной сессии, и az умеет
+        # встать в блокирующий промпт навсегда — прогон повиснет молча.
+        text=True, timeout=60).strip()
+    _issued[key] = value
+    return value
