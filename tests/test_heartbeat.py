@@ -237,3 +237,47 @@ def test_now_flag_is_debug_only_and_marks_the_beat(env):
     past = dt.datetime(2026, 1, 1, 4, 0, tzinfo=dt.timezone.utc)
     run_daily.main(["--now", past.isoformat()])
     assert hb(data_dir)["finished_at"].startswith("2026-01-01")
+
+
+# --- Находка Codex (PR #3): гонка после освобождения lock -------------------
+
+def test_older_run_does_not_overwrite_newer_heartbeat(env):
+    """Отметка обязана представлять ПОСЛЕДНИЙ завершившийся прогон.
+
+    Запись происходит уже после освобождения lock, поэтому порядок записи может
+    разойтись с порядком завершения: провалившийся прогон, вытесненный с CPU,
+    очнётся и затрёт успех более позднего ретрая ложным failure — и сторож
+    честно поднимет тревогу по несуществующей поломке.
+    """
+    data_dir, _ = env
+    later = NOW + dt.timedelta(minutes=5)
+
+    run_daily.write_heartbeat("success", now=later)      # прогон B завершился позже
+    run_daily.write_heartbeat("failure", now=NOW)        # прогон A завершился раньше, пишет позже
+
+    beat = hb(data_dir)
+    assert beat["status"] == "success", \
+        "старый исход затёр более свежий — сторож заалёртит на ровном месте"
+    assert beat["finished_at"].startswith(later.strftime("%Y-%m-%dT%H:%M"))
+
+
+def test_newer_run_does_overwrite_older_heartbeat(env):
+    """Обратная сторона: нормальная смена дней обязана работать."""
+    data_dir, _ = env
+    run_daily.write_heartbeat("failure", now=NOW)
+    run_daily.write_heartbeat("success", now=NOW + dt.timedelta(days=1))
+    assert hb(data_dir)["status"] == "success", "свежая отметка не записалась"
+
+
+def test_temp_file_name_is_unique_per_process(env, monkeypatch):
+    """Два писателя не должны делить одно имя временного файла."""
+    data_dir, _ = env
+    seen = []
+    real_replace = run_daily.os.replace
+    monkeypatch.setattr(run_daily.os, "replace",
+                        lambda src, dst: seen.append(str(src)) or real_replace(src, dst))
+
+    run_daily.write_heartbeat("success", now=NOW)
+    assert seen, "предусловие: запись действительно шла через os.replace"
+    assert str(run_daily.os.getpid()) in seen[0], \
+        f"общее имя временного файла у конкурирующих процессов: {seen[0]}"

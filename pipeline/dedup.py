@@ -48,7 +48,9 @@ def _is_tracking(key):
 def _atomic_write_json(path, data):
     """Записать JSON атомарно: сначала во временный файл, потом подменить."""
     path = pathlib.Path(path)
-    tmp = path.with_name(path.name + ".writing")
+    # Имя временного файла — с pid: два процесса, пишущих одно состояние, иначе
+    # делят один tmp, и os.replace одного уносит содержимое другого.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.writing")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1))
     os.replace(tmp, path)               # атомарно в пределах одной ФС
 

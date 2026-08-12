@@ -197,6 +197,19 @@ def heartbeat_path():
     return pathlib.Path(DATA_DIR) / HEARTBEAT_NAME
 
 
+def _heartbeat_is_newer_than(finished_at):
+    """Уже лежащая отметка новее нашей? Нечитаемую считаем устаревшей — перезапишем.
+
+    Сравнение строкой корректно, потому что формат фиксированный и всегда UTC
+    (`%Y-%m-%dT%H:%M:%SZ`): лексикографический порядок совпадает с хронологическим.
+    """
+    try:
+        current = json.loads(heartbeat_path().read_text(encoding="utf-8"))
+        return str(current.get("finished_at", "")) > str(finished_at)
+    except Exception:                               # noqa: BLE001
+        return False
+
+
 def write_heartbeat(status, now=None, reason=None):
     """Оставить отметку о завершении прогона. Никогда не поднимает исключение.
 
@@ -221,6 +234,16 @@ def write_heartbeat(status, now=None, reason=None):
             # Тот же санитайзер, что у алёрта: в тексте исключения от провайдера
             # легко оказывается URL с ключом в query.
             payload["reason"] = sanitize_alert(str(reason))[:MAX_REASON_CHARS]
+
+        # Запись идёт уже ПОСЛЕ освобождения lock, поэтому порядок записи может
+        # разойтись с порядком завершения: вытесненный с CPU провалившийся прогон
+        # очнётся и затрёт успех более позднего ретрая. Сторож поднял бы тревогу
+        # по несуществующей поломке, а причину искали бы в сервисе. Отметка обязана
+        # представлять последний ЗАВЕРШИВШИЙСЯ прогон, поэтому старую не откатываем.
+        if _heartbeat_is_newer_than(payload["finished_at"]):
+            log.info("heartbeat не тронут: на месте отметка более позднего прогона")
+            return
+
         _atomic_write_json(heartbeat_path(), payload)
     except Exception as e:                          # noqa: BLE001
         log.warning("не удалось записать heartbeat (%s) — прогон это не ломает",
@@ -527,10 +550,14 @@ def main(argv=None):
     try:
         rc = run(now=now, force=args.force, dry_run=args.dry_run)
     except Exception as e:                          # noqa: BLE001
+        # Момент ЗАВЕРШЕНИЯ, а не записи: lock уже отпущен, и порядок записи может
+        # разойтись с порядком завершения. Отметка сравнивается по этому полю, так
+        # что штамп обязан относиться к концу прогона, иначе защита от отката пустая.
+        finished = dt.datetime.now(dt.timezone.utc)
         # Heartbeat — ПЕРВЫМ делом: всё остальное в этой ветке ходит по сети
         # (Sentry, алёрт) и может не дойти, а исход прогона потерять нельзя.
         if not args.dry_run:
-            write_heartbeat("failure", now=now,
+            write_heartbeat("failure", now=now or finished,
                             reason=f"{type(e).__name__}: {e}")
         log.exception("прогон упал")
         try:
@@ -549,9 +576,10 @@ def main(argv=None):
     # меньше минимума блоков) и 3 (неразрешённое намерение), и оба означают, что
     # утром поста не будет. Код 2 пропускаем осознанно: он значит «работает ДРУГОЙ
     # прогон», чужой исход этому процессу неизвестен, а свой ещё не наступил.
+    finished = dt.datetime.now(dt.timezone.utc)
     if not args.dry_run and rc != LOCK_BUSY_CODE:
         write_heartbeat(
-            "success" if rc == 0 else "failure", now=now,
+            "success" if rc == 0 else "failure", now=now or finished,
             reason=None if rc == 0 else f"прогон завершился кодом {rc}")
     return rc
 
