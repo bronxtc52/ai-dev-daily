@@ -14,8 +14,9 @@ import json
 import pathlib
 import sys
 
+from curate import validate_digest
 from formatting import build_post, render_digest
-from run_daily import DATA_DIR, _date_label, send_telegram
+from run_daily import DATA_DIR, _date_label, sanitize_alert, send_telegram
 
 
 def load_digest(path):
@@ -36,13 +37,29 @@ def main(argv=None):
         print(f"нет файла дайджеста: {path}", file=sys.stderr)
         return 1
 
-    post = build_post(render_digest(load_digest(path), _date_label(now)))
+    digest = load_digest(path)
+    try:
+        # Тот же смоук, что и в основном прогоне: файл мог остаться от сбойной
+        # курации, а ручная переотправка — не повод слать читателю мусор.
+        validate_digest(digest)
+    except ValueError as e:
+        print(f"дайджест не прошёл проверку: {e}", file=sys.stderr)
+        return 1
+
+    post = build_post(render_digest(digest, _date_label(now)))
 
     if args.dry_run:
         print(post)
         return 0
 
-    resp = send_telegram(post)
+    try:
+        resp = send_telegram(post)
+    except Exception as e:                          # noqa: BLE001
+        # Текст исключения может содержать URL с токеном в пути.
+        print(sanitize_alert(f"отправка не удалась: {type(e).__name__}: {e}"),
+              file=sys.stderr)
+        return 1
+
     print(f"отправлено, message_id={resp.get('message_id')}, {len(post)} символов",
           file=sys.stderr)
     return 0

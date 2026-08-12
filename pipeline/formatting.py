@@ -34,9 +34,23 @@ def md_to_telegram_html(text):
     return s
 
 
+def tg_length(text):
+    """Длина в единицах, которыми меряет Telegram — UTF-16 code units.
+
+    len() в Python считает code points, а эмодзи вне BMP (🗞 🏗 📡 👇) весят
+    два юнита: пост на 4090 «символов» может оказаться за лимитом.
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
 def link(url, text):
-    """Ссылка Telegram-HTML. URL в атрибуте тоже экранируется."""
-    return f'<a href="{html.escape(url, quote=True)}">{html.escape(text)}</a>'
+    """Ссылка Telegram-HTML с экранированием текста и URL."""
+    return link_html(url, html.escape(text))
+
+
+def link_html(url, inner_html):
+    """Ссылка, текст которой УЖЕ прошёл санитайзер."""
+    return f'<a href="{html.escape(url, quote=True)}">{inner_html}</a>'
 
 
 def build_post(blocks, limit=TELEGRAM_LIMIT):
@@ -51,30 +65,68 @@ def build_post(blocks, limit=TELEGRAM_LIMIT):
     kept = []
     length = 0
     for block in blocks:
-        addition = len(block) + (len(SEPARATOR) if kept else 0)
+        addition = tg_length(block) + (tg_length(SEPARATOR) if kept else 0)
         if length + addition > limit:
             break                      # дальше не влезет — обрываем на целом блоке
         kept.append(block)
         length += addition
 
     if not kept:
-        # Даже первый блок не помещается — обрезаем его по строкам, а не по символам.
-        kept = [_truncate_by_lines(blocks[0], limit)]
+        # Даже первый блок не помещается целиком — режем его безопасно.
+        kept = [_safe_truncate(blocks[0], limit)]
 
     return SEPARATOR.join(kept)
 
 
-def _truncate_by_lines(text, limit):
-    """Обрезать по границам строк, чтобы не разорвать тег или entity."""
+_TAG = re.compile(r"<(/?)(b|i|u|s|a|code|pre)\b[^>]*>")
+
+
+def _safe_truncate(text, limit):
+    """Обрезать текст, не оставив разорванного тега или незакрытой пары.
+
+    Сначала пробуем границы строк. Если переносов нет вовсе (один гигантский
+    блок), режем по символам и чиним хвост: убираем оборванный тег и дозакрываем
+    всё, что осталось открытым, — иначе Telegram отвергнет сообщение целиком.
+    """
     lines = text.split("\n")
-    out = []
-    length = 0
-    for line in lines:
-        if length + len(line) + 1 > limit:
-            break
-        out.append(line)
-        length += len(line) + 1
-    return "\n".join(out) if out else text[:limit]
+    if len(lines) > 1:
+        out, length = [], 0
+        for line in lines:
+            if length + tg_length(line) + 1 > limit:
+                break
+            out.append(line)
+            length += tg_length(line) + 1
+        if out:
+            return _close_open_tags("\n".join(out))
+
+    cut = text
+    while tg_length(cut) > limit:
+        cut = cut[:max(1, int(len(cut) * limit / max(tg_length(cut), 1)))]
+
+    last_open = cut.rfind("<")
+    if last_open > cut.rfind(">"):
+        cut = cut[:last_open]          # выбрасываем оборванный тег целиком
+    return _close_open_tags(cut)
+
+
+def _close_open_tags(text):
+    """Дозакрыть теги, оставшиеся открытыми после обрезки."""
+    stack = []
+    for closing, name in _TAG.findall(text):
+        if closing:
+            if stack and stack[-1] == name:
+                stack.pop()
+        else:
+            stack.append(name)
+    return text + "".join(f"</{name}>" for name in reversed(stack))
+
+
+def _safe_emoji(value, fallback="🔹"):
+    """Поле emoji приходит от модели — впускаем максимум пару безопасных символов."""
+    s = str(value or "").strip()
+    if not s or len(s) > 4 or any(c in s for c in "<>&\"'"):
+        return fallback
+    return html.escape(s)
 
 
 def render_digest(digest, date_label):
@@ -91,18 +143,27 @@ def render_digest(digest, date_label):
     ]
 
     for n, b in enumerate(digest.get("blocks", []), start=1):
-        emoji = b.get("emoji", "🔹")
-        title = link(b["url"], b["title"])
-        benefit = md_to_telegram_html(b["benefit"])
+        # ВСЁ, что пришло от модели, идёт через санитайзер — включая emoji:
+        # одна угловая скобка в любом из этих полей уронит парсер Telegram,
+        # и пост не будет доставлен целиком.
+        emoji = _safe_emoji(b.get("emoji"))
+        title = link_html(b["url"], md_to_telegram_html(str(b["title"])))
+        benefit = md_to_telegram_html(str(b["benefit"]))
         blocks.append(f"{emoji} <b>{n}. {title}</b>\n{benefit}")
 
     radar = digest.get("radar") or []
     if radar:
         lines = ["📡 <b>На радаре</b>"]
         for r in radar:
-            note = md_to_telegram_html(r.get("note", ""))
-            lines.append(f"• {link(r['url'], r['title'])} — {note}")
-        blocks.append("\n".join(lines))
+            url = r.get("url")
+            if not url:
+                continue               # радар необязателен: дефектный пункт пропускаем
+            note = md_to_telegram_html(str(r.get("note", "")))
+            title_html = md_to_telegram_html(str(r.get("title") or url))
+            lines.append(f"• {link_html(url, title_html)}"
+                         + (f" — {note}" if note else ""))
+        if len(lines) > 1:
+            blocks.append("\n".join(lines))
 
     blocks.append(
         "Выберите одно и внедрите сегодня — этого уже достаточно, "

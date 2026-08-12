@@ -25,14 +25,32 @@ DIGEST = {
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    """Изолированное окружение прогона: своя data-директория и фейковая сеть."""
+    """Изолированное окружение прогона: своя data-директория и фейковая сеть.
+
+    Каждая курация отдаёт СВЕЖИЕ url: дайджест с теми же ссылками законно
+    отбрасывается дедупом, и тест проверял бы не то, ради чего написан.
+    """
     monkeypatch.setattr(run_daily, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(run_daily, "LOCK_PATH", tmp_path / "run.lock")
+    monkeypatch.setattr(run_daily, "LOG_PATH", tmp_path / "run_daily.log")
+
+    runs = {"n": 0}
+
+    def fresh_digest(*a, **k):
+        runs["n"] += 1
+        return {"blocks": [{"emoji": "🏗", "title": f"Материал {runs['n']}.{i}",
+                            "url": f"https://example.com/{runs['n']}/{i}",
+                            "benefit": "Что вам это даёт: экономия времени."}
+                           for i in range(4)],
+                "radar": [], "degraded": False}
+
     monkeypatch.setattr(run_daily, "collect_candidates",
-                        lambda **k: [{"url": "https://example.com/0", "title": "t"}])
-    monkeypatch.setattr(run_daily, "curate_digest", lambda *a, **k: dict(DIGEST))
+                        lambda **k: [{"url": "https://example.com/src", "title": "t"}])
+    monkeypatch.setattr(run_daily, "curate_digest", fresh_digest)
     sent = []
     monkeypatch.setattr(run_daily, "send_telegram",
                         lambda text, **k: sent.append(text) or {"message_id": len(sent)})
+    monkeypatch.setattr(run_daily, "send_alert", lambda text, **k: None)
     return tmp_path, sent
 
 

@@ -107,10 +107,13 @@ def test_corrupt_history_is_reported(tmp_path):
 
 
 def test_atomic_write_leaves_no_temp_files(tmp_path):
-    h = History(tmp_path / "sent.json")
-    h.record_sent(["https://example.com/a"], message_id=1, digest_hash="x", now=NOW)
+    path = tmp_path / "sent.json"
+    History(path).record_sent(["https://example.com/a"], message_id=1,
+                              digest_hash="x", now=NOW)
 
-    leftovers = [p.name for p in tmp_path.iterdir() if p.suffix in (".tmp", ".part")]
+    # Проверяем по факту содержимого директории, а не по угаданному суффиксу:
+    # ассерт на «.tmp/.part» был бы зелёным всегда — код таких файлов не создаёт.
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != path.name]
     assert leftovers == [], f"остались временные файлы записи: {leftovers}"
 
 

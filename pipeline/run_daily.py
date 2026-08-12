@@ -14,14 +14,17 @@ import logging
 import os
 import pathlib
 import re
+import socket
 import sys
+import time
 import urllib.parse
 import urllib.request
 
 from collect import collect_candidates
+import config
 from config import secret
 from curate import curate as curate_digest
-from dedup import History
+from dedup import History, canonical_url
 from formatting import build_post, render_digest
 
 # Пути резолвятся от файла, а не от cwd: под cron рабочая директория чужая,
@@ -75,21 +78,49 @@ def send_alert(text):
 _BEARER = re.compile(r"(Bearer\s+)[A-Za-z0-9_\-\.]{16,}")
 _KEY_IN_URL = re.compile(
     r"([?&](?:api[-_]?key|key|token|access[-_]?token|secret)=)[^&\s]+", re.I)
+# Токен Telegram живёт в ПУТИ URL, а не в query — отдельный паттерн.
+_TG_TOKEN_IN_PATH = re.compile(r"/bot\d{5,}:[A-Za-z0-9_\-]{20,}")
+_XAPIKEY = re.compile(r"(x-api-key['\"]?\s*[:=]\s*['\"]?)[A-Za-z0-9_\-]{16,}", re.I)
 
 
-def sanitize_alert(text, secrets=()):
-    """Вычистить значения секретов из текста алёрта.
+def sanitize_alert(text, secrets=None):
+    """Вычистить значения секретов из текста.
 
-    В сообщение об ошибке провайдера легко попадает URL с ключом в query —
-    и алёрт о сбое сам становится утечкой.
+    По умолчанию маскируем по реестру фактически выданных значений
+    (config.issued_secrets): в проде секреты приходят из Key Vault, и маскировка
+    «по os.environ» не сработала бы вообще — там их нет.
     """
     out = str(text)
-    for value in secrets:
-        if value:
-            out = out.replace(value, "***")
+    values = config.issued_secrets() if secrets is None else secrets
+    for value in values:
+        if value and len(str(value)) >= 8:
+            out = out.replace(str(value), "***")
     out = _BEARER.sub(r"\1***", out)
     out = _KEY_IN_URL.sub(r"\1***", out)
+    out = _TG_TOKEN_IN_PATH.sub("/bot***", out)
+    out = _XAPIKEY.sub(r"\1***", out)
     return out
+
+
+class SecretRedactingFilter(logging.Filter):
+    """Санитайзер на самом логгере.
+
+    Алёрт чистился, а traceback от log.exception уходил в файл сырым — это
+    отдельный путь утечки, не совпадающий с алёртом.
+    """
+
+    def filter(self, record):
+        try:
+            record.msg = sanitize_alert(record.getMessage())
+            record.args = ()
+            if record.exc_info:
+                record.exc_text = sanitize_alert(
+                    logging.Formatter().formatException(record.exc_info))
+                record.exc_info = None
+        except Exception:                           # noqa: BLE001
+            record.msg = "[запись лога вычищена: ошибка санитайзера]"
+            record.args = ()
+        return True
 
 
 # ---------- блокировка -------------------------------------------------------
@@ -103,36 +134,114 @@ def _pid_alive(pid):
 
 
 def acquire_lock(now, path=None):
-    """Занять lock. False — если жив другой прогон.
+    """Занять lock атомарно. False — если жив другой прогон.
 
-    Протухший lock (процесс мёртв или висит дольше потолка) перехватываем:
-    иначе одно зависшее утро заблокировало бы все следующие.
+    Создание через O_CREAT|O_EXCL: проверка «файла нет» и запись должны быть
+    одной операцией, иначе два почти одновременных запуска (cron наложился на
+    ручной) оба пройдут проверку и оба отправят пост.
     """
     path = pathlib.Path(path or LOCK_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"pid": os.getpid(), "started": now.isoformat()})
 
-    if path.exists():
+    for _ in range(2):
         try:
-            held = json.loads(path.read_text())
-            started = dt.datetime.fromisoformat(held["started"])
-            age = (now - started).total_seconds()
-            if _pid_alive(held.get("pid")) and age < MAX_RUNTIME_SECONDS:
-                log.error("прогон уже идёт (pid %s, %.0f c) — выходим",
-                          held.get("pid"), age)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(payload)
+            return True
+        except FileExistsError:
+            if not _steal_if_stale(path, now):
                 return False
-            log.warning("перехватываем протухший lock (pid %s)", held.get("pid"))
-        except (json.JSONDecodeError, KeyError, ValueError, OSError):
-            log.warning("lock нечитаем — перехватываем")
+    return False
 
-    path.write_text(json.dumps({"pid": os.getpid(), "started": now.isoformat()}))
+
+def _steal_if_stale(path, now):
+    """Снять чужой lock, только если его владелец мёртв.
+
+    Живой процесс, работающий дольше потолка, lock не теряет: отобрать его —
+    значит получить два параллельных прогона, ровно то, от чего lock защищает.
+    """
+    try:
+        held = json.loads(pathlib.Path(path).read_text())
+    except (json.JSONDecodeError, ValueError, OSError):
+        log.warning("lock нечитаем — перехватываем")
+        _force_unlink(path)
+        return True
+
+    pid, started = held.get("pid"), held.get("started")
+    if _pid_alive(pid):
+        try:
+            age = (now - dt.datetime.fromisoformat(started)).total_seconds()
+        except (TypeError, ValueError):
+            age = 0
+        if age >= MAX_RUNTIME_SECONDS:
+            log.error("прогон pid %s жив, но идёт %.0f c — дольше потолка; "
+                      "не отбираем lock, разбирайтесь вручную", pid, age)
+        else:
+            log.error("прогон уже идёт (pid %s) — выходим", pid)
+        return False
+
+    log.warning("владелец lock (pid %s) мёртв — перехватываем", pid)
+    _force_unlink(path)
     return True
 
 
-def release_lock(path=None):
+def _force_unlink(path):
     try:
-        pathlib.Path(path or LOCK_PATH).unlink(missing_ok=True)
+        pathlib.Path(path).unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def release_lock(path=None):
+    """Снять СВОЙ lock.
+
+    Без проверки владельца очнувшийся зависший процесс снёс бы lock того, кто
+    его перехватил, и открыл дорогу третьему параллельному прогону.
+    """
+    path = pathlib.Path(path or LOCK_PATH)
+    try:
+        held = json.loads(path.read_text())
+    except (json.JSONDecodeError, ValueError, OSError):
+        return
+    if held.get("pid") == os.getpid():
+        _force_unlink(path)
+
+
+def _try_alert(text):
+    """Уведомить, не роняя основной поток: доставка алёрта — best-effort."""
+    try:
+        send_alert(sanitize_alert(text))
+    except Exception:                               # noqa: BLE001
+        log.error("не удалось доставить уведомление")
+
+
+# ---------- доставка ---------------------------------------------------------
+
+# Ошибки, которые случаются ДО передачи запроса: соединение не установлено,
+# значит сообщение заведомо не доставлено и повтор безопасен.
+_DEFINITELY_NOT_DELIVERED = (socket.gaierror, ConnectionRefusedError)
+
+
+def _send_once_or_safely_retry(post, attempts=3, base_delay=2.0):
+    """Отправить пост, повторяя только заведомо недоставленные попытки.
+
+    Отправка НЕ идемпотентна: если Telegram принял сообщение, а ответ потерялся
+    по дороге (RST, таймаут чтения), повтор создаст ВТОРОЙ пост у читателя.
+    Поэтому вслепую ретраить нельзя — только случаи, где соединение вообще не
+    состоялось. Остальное разбирает журнал намерений: молчание безопаснее дубля.
+    """
+    for i in range(attempts):
+        try:
+            return send_telegram(post)
+        except _DEFINITELY_NOT_DELIVERED as e:
+            if i == attempts - 1:
+                raise
+            log.warning("соединение с Telegram не состоялось (%s) — повтор %d/%d",
+                        type(e).__name__, i + 2, attempts)
+            time.sleep(base_delay * (2 ** i))
+    raise RuntimeError("недостижимо")
 
 
 # ---------- прогон -----------------------------------------------------------
@@ -147,7 +256,10 @@ def run(now=None, force=False, dry_run=False):
     data_dir = pathlib.Path(DATA_DIR)
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    if not acquire_lock(now):
+    # Lock живёт рядом с данными прогона: так он автоматически следует за
+    # DATA_DIR и тесты не пишут в рабочий репозиторий.
+    lock_path = data_dir / "run.lock"
+    if not acquire_lock(now, path=lock_path):
         return 2
 
     try:
@@ -162,19 +274,41 @@ def run(now=None, force=False, dry_run=False):
             if history.has_pending_today(now):
                 log.warning("есть неразрешённое намерение за сегодня "
                             "(прошлый прогон мог отправить) — молчим до завтра")
-                return 0
+                _try_alert("⚠️ Дайджест сегодня не отправлен: прошлый прогон "
+                           "оборвался на отправке, исход неизвестен. "
+                           "Проверьте канал; повтор — с флагом --force.")
+                return 3
 
         candidates = collect_candidates(now=now)
+        seen = history.seen_urls(now)
         fresh = history.filter_new(candidates, now=now)
         log.info("кандидатов: %d, после дедупа: %d", len(candidates), len(fresh))
 
-        digest = curate_digest(fresh)
-        if not digest.get("blocks"):
-            log.error("дайджест пуст — отправлять нечего")
+        # seen передаём внутрь: Perplexity добирает материалы уже после этого
+        # фильтра, и без второй проверки они минуют дедуп целиком.
+        digest = curate_digest(fresh, seen_urls=seen)
+
+        # Страховка на случай, если модель всё-таки вернула отправленное раньше.
+        kept = [b for b in digest.get("blocks", [])
+                if canonical_url(b.get("url", "")) not in seen]
+        if len(kept) != len(digest.get("blocks", [])):
+            log.warning("отброшено %d блоков, уже отправленных ранее",
+                        len(digest.get("blocks", [])) - len(kept))
+        digest["blocks"] = kept
+        digest["radar"] = [r for r in (digest.get("radar") or [])
+                           if canonical_url(r.get("url", "")) not in seen]
+
+        if not digest["blocks"]:
+            log.error("после дедупа не осталось блоков — отправлять нечего")
+            _try_alert("⚠️ Дайджест сегодня не отправлен: после дедупа "
+                       "не осталось новых материалов.")
             return 1
 
         post = build_post(render_digest(digest, _date_label(now)))
-        urls = [b["url"] for b in digest["blocks"]]
+        # Радар тоже уходит читателю, значит тоже попадает в историю —
+        # иначе завтра он вернётся как «новый».
+        urls = ([b["url"] for b in digest["blocks"]]
+                + [r["url"] for r in (digest.get("radar") or []) if r.get("url")])
         digest_hash = hashlib.sha256(post.encode()).hexdigest()[:16]
 
         (data_dir / f"digest-{now.date().isoformat()}.json").write_text(
@@ -188,7 +322,7 @@ def run(now=None, force=False, dry_run=False):
         # Намерение фиксируем ДО отправки: если процесс погибнет между вызовом
         # Telegram и записью результата, завтрашний прогон об этом узнает.
         history.record_intent(digest_hash, now)
-        resp = send_telegram(post)
+        resp = _send_once_or_safely_retry(post)
         history.record_sent(urls, message_id=resp.get("message_id"),
                             digest_hash=digest_hash, now=now)
 
@@ -196,7 +330,7 @@ def run(now=None, force=False, dry_run=False):
                  len(digest["blocks"]), resp.get("message_id"))
         return 0
     finally:
-        release_lock()
+        release_lock(lock_path)
 
 
 def main(argv=None):
@@ -213,22 +347,25 @@ def main(argv=None):
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"),
-                  logging.StreamHandler(sys.stderr)])
+                  logging.StreamHandler(sys.stderr)],
+        # force: без него basicConfig — no-op при уже настроенном root-логгере,
+        # и записи молча уходят мимо файла.
+        force=True)
+    redactor = SecretRedactingFilter()
+    for h in logging.getLogger().handlers:
+        h.addFilter(redactor)
 
     now = dt.datetime.fromisoformat(args.now) if args.now else None
+    if now is not None and now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)   # naive-отметки портят журнал
 
     try:
         return run(now=now, force=args.force, dry_run=args.dry_run)
     except Exception as e:                          # noqa: BLE001
         log.exception("прогон упал")
         try:
-            leaked = [os.environ.get(k) for k in
-                      ("TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY",
-                       "PERPLEXITY_API_KEY", "X_BEARER_TOKEN",
-                       "EXA_API_KEY", "GITHUB_TOKEN")]
             send_alert(sanitize_alert(
-                f"⚠️ Дайджест не отправлен.\n{type(e).__name__}: {e}",
-                secrets=[v for v in leaked if v]))
+                f"⚠️ Дайджест не отправлен.\n{type(e).__name__}: {e}"))
         except Exception:                           # noqa: BLE001
             # Алёрт — best-effort: его падение не должно маскировать исходную ошибку.
             log.error("не удалось доставить алёрт о сбое")

@@ -79,15 +79,17 @@ python3 pipeline/run_daily.py             # боевой прогон
 
 ```cron
 CRON_TZ=UTC
-0 4 * * * /path/to/ai-dev-daily/.venv/bin/python \
-          /path/to/ai-dev-daily/pipeline/run_daily.py >> /var/log/ai-dev-daily.log 2>&1
+0 4 * * * cd /path/to/ai-dev-daily && set -a && . ./.env && set +a && \
+          .venv/bin/python pipeline/run_daily.py >> /var/log/ai-dev-daily.log 2>&1
 ```
 
 `CRON_TZ=UTC` обязателен: без него расписание поедет за локальной зоной сервера.
 
-Секреты в cron-окружении: интерактивной сессии там нет, поэтому либо заранее
-собранный `.env` рядом с сервисом, либо non-interactive вход в Key Vault
-(service principal / managed identity). `pipeline/config.py` поддерживает оба пути.
+`config.py` **не читает `.env` сам** — файл нужно занести в окружение (`set -a`,
+как в строке выше) либо объявить переменные прямо в crontab. Интерактивной
+сессии в cron нет, поэтому вход в Key Vault должен быть non-interactive
+(service principal / managed identity) — или значения секретов подаются
+напрямую одноимёнными переменными.
 
 ## Поведение при сбоях
 

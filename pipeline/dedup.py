@@ -89,10 +89,14 @@ class History:
         for e in self._data.get("entries", []):
             try:
                 sent_at = dt.datetime.fromisoformat(e["sent_at"])
-            except (KeyError, ValueError):
+                if sent_at.tzinfo is None:
+                    # Запись без таймзоны (например, от отладочного --now) иначе
+                    # роняла бы сравнение TypeError каждое следующее утро.
+                    sent_at = sent_at.replace(tzinfo=dt.timezone.utc)
+                if sent_at >= edge:
+                    out.add(e["url"])
+            except (KeyError, ValueError, TypeError):
                 continue
-            if sent_at >= edge:
-                out.add(e["url"])
         return out
 
     def filter_new(self, candidates, now, window_days=WINDOW_DAYS):
