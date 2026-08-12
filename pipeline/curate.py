@@ -79,17 +79,71 @@ def ask_perplexity(queries=None):
     return out
 
 
+# Схема дайджеста. Отдаём её модели как инструмент и требуем вызвать именно его:
+# структуру тогда валидирует сам API, а не наш парсер. Свободный JSON в тексте
+# ломался на боевом прогоне 2026-08-12 («Expecting ',' delimiter») — модель
+# недетерминирована, и одной кавычки внутри строки достаточно, чтобы утро пропало.
+DIGEST_TOOL = {
+    "name": "publish_digest",
+    "description": "Опубликовать отобранные материалы утреннего дайджеста.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "blocks": {
+                "type": "array",
+                "minItems": MIN_BLOCKS,
+                "maxItems": MAX_BLOCKS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "emoji": {"type": "string", "description": "один эмодзи"},
+                        "title": {"type": "string"},
+                        "url": {"type": "string"},
+                        "benefit": {"type": "string",
+                                    "description": "начинается с «Что вам это даёт:»"},
+                    },
+                    "required": ["emoji", "title", "url", "benefit"],
+                },
+            },
+            "radar": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "url": {"type": "string"},
+                        "note": {"type": "string"},
+                    },
+                    "required": ["title", "url", "note"],
+                },
+            },
+        },
+        "required": ["blocks", "radar"],
+    },
+}
+
+
 def ask_claude(prompt):
-    """Один вызов Claude. Возвращает распарсенный JSON-дайджест."""
+    """Один вызов Claude. Возвращает структуру дайджеста."""
     key = secret("ANTHROPIC_API_KEY")
     data = with_retry(lambda: _post_json(
         "https://api.anthropic.com/v1/messages",
         {"model": CLAUDE_MODEL, "max_tokens": 4000,
-         "messages": [{"role": "user", "content": prompt}]},
+         "messages": [{"role": "user", "content": prompt}],
+         "tools": [DIGEST_TOOL],
+         "tool_choice": {"type": "tool", "name": "publish_digest"}},
         {"x-api-key": key, "anthropic-version": "2023-06-01",
          "Content-Type": "application/json"}))
 
+    for part in data.get("content", []):
+        if part.get("type") == "tool_use" and part.get("name") == "publish_digest":
+            return part["input"]
+
+    # Модель не вызвала инструмент — падаем назад на разбор текста, чтобы
+    # редкий отказ tool_choice не стоил утреннего поста.
     text = "".join(part.get("text", "") for part in data.get("content", []))
+    if not text.strip():
+        raise ValueError(f"пустой ответ модели (stop_reason={data.get('stop_reason')})")
     return _parse_json_answer(text)
 
 

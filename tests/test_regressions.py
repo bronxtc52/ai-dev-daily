@@ -473,3 +473,46 @@ def test_history_entries_do_not_grow_forever(tmp_path):
 
     assert len(entries) == 1, "записи старше окна дедупа должны вычищаться"
     assert entries[0]["url"] == "https://example.com/new"
+
+
+# --- Боевой сбой 2026-08-12: свободный JSON от модели ломается ---------------
+
+def test_digest_comes_from_tool_use_not_text_parsing(monkeypatch):
+    """Структуру гарантирует схема инструмента, а не наш парсер текста."""
+    captured = {}
+
+    def fake_post(url, payload, headers, **k):
+        captured["payload"] = payload
+        return {"content": [{"type": "tool_use", "name": "publish_digest",
+                             "input": _digest(4)}],
+                "stop_reason": "tool_use"}
+
+    monkeypatch.setattr(curate, "_post_json", fake_post)
+    monkeypatch.setattr(curate, "secret", lambda k: "fake-key")
+
+    digest = curate.ask_claude("промпт")
+
+    assert len(digest["blocks"]) == 4
+    assert captured["payload"]["tool_choice"]["name"] == "publish_digest", \
+        "вызов инструмента должен быть форсирован, иначе модель вернёт текст"
+    schema = captured["payload"]["tools"][0]["input_schema"]
+    assert schema["properties"]["blocks"]["minItems"] == curate.MIN_BLOCKS
+
+
+def test_text_fallback_still_works_if_tool_not_called(monkeypatch):
+    """Редкий отказ tool_choice не должен стоить утреннего поста."""
+    monkeypatch.setattr(curate, "_post_json", lambda *a, **k: {
+        "content": [{"type": "text", "text": json.dumps(_digest(3))}],
+        "stop_reason": "end_turn"})
+    monkeypatch.setattr(curate, "secret", lambda k: "fake-key")
+
+    assert len(curate.ask_claude("промпт")["blocks"]) == 3
+
+
+def test_empty_model_answer_is_reported_clearly(monkeypatch):
+    monkeypatch.setattr(curate, "_post_json", lambda *a, **k: {
+        "content": [], "stop_reason": "max_tokens"})
+    monkeypatch.setattr(curate, "secret", lambda k: "fake-key")
+
+    with pytest.raises(ValueError, match="пустой ответ"):
+        curate.ask_claude("промпт")
