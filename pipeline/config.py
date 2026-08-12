@@ -44,6 +44,9 @@ def secret(key):
 
     value = subprocess.check_output(
         ["az", "keyvault", "secret", "show", "--vault-name", VAULT,
-         "--name", name, "--query", "value", "-o", "tsv"], text=True).strip()
+         "--name", name, "--query", "value", "-o", "tsv"],
+        # timeout обязателен: под cron нет интерактивной сессии, и az умеет
+        # встать в блокирующий промпт навсегда — прогон повиснет молча.
+        text=True, timeout=60).strip()
     _issued[key] = value
     return value

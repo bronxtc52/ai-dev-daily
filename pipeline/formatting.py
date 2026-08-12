@@ -103,10 +103,20 @@ def _safe_truncate(text, limit):
     while tg_length(cut) > limit:
         cut = cut[:max(1, int(len(cut) * limit / max(tg_length(cut), 1)))]
 
-    last_open = cut.rfind("<")
-    if last_open > cut.rfind(">"):
-        cut = cut[:last_open]          # выбрасываем оборванный тег целиком
-    return _close_open_tags(cut)
+    # Дозакрытие тегов добавляет символы уже ПОСЛЕ подсчёта, поэтому ужимаем,
+    # пока итоговая строка вместе с закрывающими тегами не уложится в лимит.
+    result = _close_open_tags(_drop_dangling_tag(cut))
+    while tg_length(result) > limit and cut:
+        overflow = tg_length(result) - limit
+        cut = cut[:max(0, len(cut) - max(overflow, 1))]
+        result = _close_open_tags(_drop_dangling_tag(cut))
+    return result
+
+
+def _drop_dangling_tag(text):
+    """Выбросить тег, обрубленный посередине."""
+    last_open = text.rfind("<")
+    return text[:last_open] if last_open > text.rfind(">") else text
 
 
 def _close_open_tags(text):
@@ -147,7 +157,11 @@ def render_digest(digest, date_label):
         # одна угловая скобка в любом из этих полей уронит парсер Telegram,
         # и пост не будет доставлен целиком.
         emoji = _safe_emoji(b.get("emoji"))
-        title = link_html(b["url"], md_to_telegram_html(str(b["title"])))
+        # Заголовок и так внутри <b>: вложенный одноимённый тег от модели
+        # снимаем, чтобы не проверять на живом парсере Telegram.
+        title_html = md_to_telegram_html(str(b["title"])).replace(
+            "<b>", "").replace("</b>", "")
+        title = link_html(b["url"], title_html)
         benefit = md_to_telegram_html(str(b["benefit"]))
         blocks.append(f"{emoji} <b>{n}. {title}</b>\n{benefit}")
 

@@ -9,6 +9,7 @@
 import argparse
 import datetime as dt
 import hashlib
+import html
 import json
 import logging
 import os
@@ -23,7 +24,7 @@ import urllib.request
 from collect import collect_candidates
 import config
 from config import secret
-from curate import curate as curate_digest
+from curate import MIN_BLOCKS, curate as curate_digest
 from dedup import History, canonical_url
 from formatting import build_post, render_digest
 
@@ -178,6 +179,11 @@ def _steal_if_stale(path, now):
         if age >= MAX_RUNTIME_SECONDS:
             log.error("прогон pid %s жив, но идёт %.0f c — дольше потолка; "
                       "не отбираем lock, разбирайтесь вручную", pid, age)
+            # Отобрать lock у живого нельзя (получим два параллельных прогона),
+            # но и молчать нельзя: иначе один висяк убивает сервис навсегда.
+            _try_alert(f"⚠️ Дайджест не отправлен: прошлый прогон (pid {pid}) "
+                       f"висит {age / 60:.0f} мин и держит блокировку. "
+                       f"Нужно вмешательство: снимите процесс вручную.")
         else:
             log.error("прогон уже идёт (pid %s) — выходим", pid)
         return False
@@ -209,19 +215,40 @@ def release_lock(path=None):
         _force_unlink(path)
 
 
-def _try_alert(text):
-    """Уведомить, не роняя основной поток: доставка алёрта — best-effort."""
-    try:
-        send_alert(sanitize_alert(text))
-    except Exception:                               # noqa: BLE001
-        log.error("не удалось доставить уведомление")
+def _try_alert(text, attempts=3, base_delay=2.0):
+    """Уведомить, не роняя основной поток: доставка алёрта — best-effort.
+
+    В отличие от дайджеста, алёрт повторяем смело: два одинаковых «не отправлено»
+    безвредны, а тишина нарушает главное обещание сервиса — узнать о сбое
+    сообщением, а не по отсутствию поста. Сбой сети — самый частый случай, и
+    именно в нём одна попытка почти наверняка потерялась бы.
+    """
+    safe = sanitize_alert(text)
+    for i in range(attempts):
+        try:
+            send_alert(safe)
+            return True
+        except Exception:                           # noqa: BLE001
+            if i < attempts - 1:
+                time.sleep(base_delay * (2 ** i))
+    log.error("не удалось доставить уведомление за %d попыток", attempts)
+    return False
 
 
 # ---------- доставка ---------------------------------------------------------
 
 # Ошибки, которые случаются ДО передачи запроса: соединение не установлено,
 # значит сообщение заведомо не доставлено и повтор безопасен.
-_DEFINITELY_NOT_DELIVERED = (socket.gaierror, ConnectionRefusedError)
+# ВАЖНО: urllib заворачивает их в URLError, наружу голый gaierror не выходит —
+# проверять надо .reason, иначе ветка повтора недостижима вообще.
+_NOT_DELIVERED_REASONS = (socket.gaierror, ConnectionRefusedError)
+
+
+def _is_definitely_not_delivered(exc):
+    if isinstance(exc, _NOT_DELIVERED_REASONS):
+        return True
+    reason = getattr(exc, "reason", None)
+    return isinstance(reason, _NOT_DELIVERED_REASONS)
 
 
 def _send_once_or_safely_retry(post, attempts=3, base_delay=2.0):
@@ -235,8 +262,8 @@ def _send_once_or_safely_retry(post, attempts=3, base_delay=2.0):
     for i in range(attempts):
         try:
             return send_telegram(post)
-        except _DEFINITELY_NOT_DELIVERED as e:
-            if i == attempts - 1:
+        except Exception as e:                      # noqa: BLE001
+            if not _is_definitely_not_delivered(e) or i == attempts - 1:
                 raise
             log.warning("соединение с Telegram не состоялось (%s) — повтор %d/%d",
                         type(e).__name__, i + 2, attempts)
@@ -298,17 +325,28 @@ def run(now=None, force=False, dry_run=False):
         digest["radar"] = [r for r in (digest.get("radar") or [])
                            if canonical_url(r.get("url", "")) not in seen]
 
-        if not digest["blocks"]:
-            log.error("после дедупа не осталось блоков — отправлять нечего")
-            _try_alert("⚠️ Дайджест сегодня не отправлен: после дедупа "
-                       "не осталось новых материалов.")
+        # Смоук состава validate_digest отработал ДО этого фильтра, поэтому
+        # нижнюю границу проверяем ещё раз: дедуп мог срезать блоки после него.
+        if len(digest["blocks"]) < MIN_BLOCKS:
+            log.error("после дедупа осталось %d блоков (нужно от %d) — не шлём",
+                      len(digest["blocks"]), MIN_BLOCKS)
+            _try_alert(f"⚠️ Дайджест сегодня не отправлен: после дедупа осталось "
+                       f"{len(digest['blocks'])} новых материалов, нужно "
+                       f"минимум {MIN_BLOCKS}.")
             return 1
 
         post = build_post(render_digest(digest, _date_label(now)))
         # Радар тоже уходит читателю, значит тоже попадает в историю —
-        # иначе завтра он вернётся как «новый».
-        urls = ([b["url"] for b in digest["blocks"]]
-                + [r["url"] for r in (digest.get("radar") or []) if r.get("url")])
+        # иначе завтра он вернётся как «новый». Но записываем ТОЛЬКО то, что
+        # уцелело после усечения по лимиту: помеченный отправленным блок,
+        # который выпал из поста, не вернётся 30 дней и потеряется молча.
+        candidate_urls = ([b["url"] for b in digest["blocks"]]
+                          + [r["url"] for r in (digest.get("radar") or [])
+                             if r.get("url")])
+        urls = [u for u in candidate_urls if html.escape(u, quote=True) in post]
+        if len(urls) != len(candidate_urls):
+            log.warning("%d материалов не влезли в лимит и в историю не пишутся",
+                        len(candidate_urls) - len(urls))
         digest_hash = hashlib.sha256(post.encode()).hexdigest()[:16]
 
         (data_dir / f"digest-{now.date().isoformat()}.json").write_text(
