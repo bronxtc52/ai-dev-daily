@@ -79,17 +79,26 @@ python3 pipeline/run_daily.py             # боевой прогон
 
 ```cron
 CRON_TZ=UTC
-0 4 * * * cd /path/to/ai-dev-daily && set -a && . ./.env && set +a && \
-          .venv/bin/python pipeline/run_daily.py >> /var/log/ai-dev-daily.log 2>&1
+0 4 * * * cd /path/to/ai-dev-daily && env KEYVAULT_NAME=<vault> \
+          X_BEARER_TOKEN_SECRET=<имя> ... TELEGRAM_CHAT_ID_SECRET=<имя> \
+          .venv/bin/python pipeline/run_daily.py >> ~/logs/ai-dev-daily.log 2>&1
 ```
 
-`CRON_TZ=UTC` обязателен: без него расписание поедет за локальной зоной сервера.
+`CRON_TZ=UTC` обязателен и должен стоять **непосредственно перед** задачей:
+переменные времени в crontab действуют до следующего переопределения, и строка,
+добавленная после чужого `TZ=...`, унаследует чужую зону.
 
-`config.py` **не читает `.env` сам** — файл нужно занести в окружение (`set -a`,
-как в строке выше) либо объявить переменные прямо в crontab. Интерактивной
-сессии в cron нет, поэтому вход в Key Vault должен быть non-interactive
-(service principal / managed identity) — или значения секретов подаются
-напрямую одноимёнными переменными.
+`config.py` **не читает `.env` сам** — переменные задаются прямо в crontab (как
+выше) либо заносятся в окружение через `set -a`. Интерактивной сессии в cron нет,
+поэтому вход в Key Vault должен быть non-interactive: **managed identity** на
+хосте (наш вариант) или service principal.
+
+Проверять установку нужно запуском в cron-подобном окружении, а не обычным
+shell — иначе не видно, что задаче не хватает PATH или доступа:
+
+```bash
+env -i HOME=$HOME PATH=/usr/local/bin:/usr/bin:/bin /bin/bash -c '<строка из crontab> --dry-run'
+```
 
 ## Поведение при сбоях
 
