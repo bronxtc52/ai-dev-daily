@@ -114,6 +114,9 @@ env -i HOME=$HOME PATH=/usr/local/bin:/usr/bin:/bin /bin/bash -c '<строка 
 | Прошлый прогон завис | Lock мёртвого владельца перехватывается; у живого не отбирается никогда, но приходит алёрт «вмешайтесь» |
 | Cron не запустился вовсе | **Не покрыто** — нужен внешний heartbeat, см. `docs/specs/plan.md` |
 
+Ошибки уходят в Sentry (release тегируется по git sha). Подключение
+best-effort: без DSN или при недоступном Sentry сервис работает как обычно.
+
 ## Секреты и конфигурация
 
 Значений ключей в репозитории нет и быть не может. `pipeline/config.py` разрешает каждый
@@ -129,6 +132,7 @@ env -i HOME=$HOME PATH=/usr/local/bin:/usr/bin:/bin /bin/bash -c '<строка 
 | Курация: добор свежего (Perplexity) | `PERPLEXITY_API_KEY` |
 | Курация: отбор и тексты (Claude) | `ANTHROPIC_API_KEY` |
 | Доставка Telegram | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` |
+| Трекинг ошибок (необязательно) | `SENTRY_DSN` |
 
 ---
 

@@ -632,3 +632,41 @@ def test_perplexity_results_outside_window_are_dropped(monkeypatch):
     urls = [c["url"] for c in got]
     assert "https://example.com/fresh" in urls
     assert "https://example.com/old" not in urls, "материал вне окна свежести доехал"
+
+
+# --- Observability: Sentry подключается, но не может уронить прогон ----------
+
+def test_sentry_absence_does_not_break_run(monkeypatch, tmp_path):
+    """Нет DSN или нет SDK — сервис работает как обычно."""
+    monkeypatch.setattr(run_daily, "_resolve_sentry_dsn", lambda: None)
+    monkeypatch.setattr(run_daily, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(run_daily, "LOCK_PATH", tmp_path / "run.lock")
+
+    run_daily.init_sentry()          # не должно бросать
+
+    monkeypatch.setattr(run_daily, "collect_candidates",
+                        lambda **k: [{"url": "https://example.com/src", "title": "t"}])
+    monkeypatch.setattr(run_daily, "curate_digest", lambda *a, **k: _digest(4))
+    sent = []
+    monkeypatch.setattr(run_daily, "send_telegram",
+                        lambda text, **k: sent.append(text) or {"message_id": 1})
+    assert run_daily.run(now=NOW) == 0
+
+
+def test_sentry_init_failure_is_swallowed(monkeypatch):
+    """Недоступный Sentry не должен стоить утреннего дайджеста."""
+    monkeypatch.setattr(run_daily, "_resolve_sentry_dsn",
+                        lambda: (_ for _ in ()).throw(RuntimeError("KV недоступен")))
+    run_daily.init_sentry()          # не должно бросать
+
+
+def test_sentry_dsn_is_not_logged(monkeypatch, tmp_path, caplog):
+    """DSN содержит ключ проекта — в логи он попадать не должен."""
+    dsn = "https://abc123def456@sentry.example.com/42"
+    monkeypatch.setattr(run_daily, "_resolve_sentry_dsn", lambda: dsn)
+    monkeypatch.setattr(run_daily, "_sentry_init", lambda **kw: None)
+
+    with caplog.at_level(logging.INFO):
+        run_daily.init_sentry()
+
+    assert dsn not in caplog.text

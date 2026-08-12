@@ -74,6 +74,58 @@ def send_alert(text):
         return json.load(r)
 
 
+# ---------- Sentry -----------------------------------------------------------
+
+def _resolve_sentry_dsn():
+    """DSN из окружения или Key Vault; None, если не настроен."""
+    try:
+        return secret("SENTRY_DSN")
+    except RuntimeError:
+        return None                 # Sentry не обязателен для работы сервиса
+
+
+def _sentry_init(**kwargs):
+    import sentry_sdk
+    sentry_sdk.init(**kwargs)
+
+
+def init_sentry():
+    """Подключить Sentry, если он настроен.
+
+    Best-effort целиком: ни отсутствие DSN, ни недоступность SDK или самого
+    Sentry не должны стоить утреннего дайджеста. DSN не логируем — в нём ключ.
+    """
+    try:
+        dsn = _resolve_sentry_dsn()
+        if not dsn:
+            log.info("Sentry не настроен — работаем без него")
+            return False
+        _sentry_init(
+            dsn=dsn,
+            environment=os.environ.get("SENTRY_ENVIRONMENT", "prod"),
+            release=os.environ.get("SENTRY_RELEASE") or _git_release(),
+            send_default_pii=False,     # в событиях и так нет пользовательских данных
+            traces_sample_rate=0.0,     # трейсы для суточного cron избыточны
+        )
+        log.info("Sentry подключён")
+        return True
+    except Exception as e:              # noqa: BLE001
+        log.warning("Sentry не подключился (%s) — продолжаем без него",
+                    type(e).__name__)
+        return False
+
+
+def _git_release():
+    """Версия для тегирования релиза — короткий sha рабочей копии."""
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "--short", "HEAD"],
+            text=True, timeout=10).strip()
+    except Exception:                   # noqa: BLE001
+        return None
+
+
 # ---------- безопасность вывода ---------------------------------------------
 
 _BEARER = re.compile(r"(Bearer\s+)[A-Za-z0-9_\-\.]{16,}")
@@ -415,6 +467,8 @@ def main(argv=None):
     for h in logging.getLogger().handlers:
         h.addFilter(redactor)
 
+    init_sentry()
+
     now = dt.datetime.fromisoformat(args.now) if args.now else None
     if now is not None and now.tzinfo is None:
         now = now.replace(tzinfo=dt.timezone.utc)   # naive-отметки портят журнал
@@ -423,6 +477,12 @@ def main(argv=None):
         return run(now=now, force=args.force, dry_run=args.dry_run)
     except Exception as e:                          # noqa: BLE001
         log.exception("прогон упал")
+        try:
+            import sentry_sdk
+            sentry_sdk.capture_exception(e)
+            sentry_sdk.flush(timeout=10)
+        except Exception:                           # noqa: BLE001
+            pass                                    # Sentry не критичен для потока
         # Через _try_alert, а не одним вызовом: падение прогона чаще всего
         # вызвано сетью, и одиночная попытка потерялась бы ровно тогда,
         # когда уведомление нужнее всего.
