@@ -25,7 +25,7 @@ from collect import collect_candidates
 import config
 from config import secret
 from curate import MIN_BLOCKS, curate as curate_digest
-from dedup import History, canonical_url
+from dedup import History, _atomic_write_json, canonical_url
 from formatting import build_post, render_digest
 
 # Пути резолвятся от файла, а не от cwd: под cron рабочая директория чужая,
@@ -36,6 +36,7 @@ LOCK_PATH = DATA_DIR / "run.lock"
 LOG_PATH = REPO_ROOT / "logs" / "run_daily.log"
 
 MAX_RUNTIME_SECONDS = 600       # потолок прогона; лежащий дольше lock считаем протухшим
+LOCK_BUSY_CODE = 2              # код возврата «работает другой прогон»
 
 log = logging.getLogger("run_daily")
 
@@ -174,6 +175,56 @@ class SecretRedactingFilter(logging.Filter):
             record.msg = "[запись лога вычищена: ошибка санитайзера]"
             record.args = ()
         return True
+
+
+# ---------- heartbeat --------------------------------------------------------
+#
+# След прогона для ВНЕШНЕГО монитора (server-watchdog). Собственный алёрт сервиса
+# ловит только упавший процесс; отсутствие процесса — cron не сработал, venv
+# сломался, identity потеряла доступ — послать алёрт некому. Файл отвечает на
+# вопрос, на который изнутри ответить нельзя: «прогон вообще состоялся?».
+#
+# Пишем на ЗАВЕРШЕНИЕ и только в боевом режиме: dry-run обновлял бы отметку
+# свежести, и ручная отладка вечером маскировала бы пропущенное утро.
+
+HEARTBEAT_NAME = "heartbeat.json"
+SERVICE_NAME = "ai-dev-daily"    # подпись отметки: чужой JSON не сойдёт за нашу
+MAX_REASON_CHARS = 500          # причина — для человека в алёрте, не лог целиком
+
+
+def heartbeat_path():
+    """Абсолютный путь к отметке. Считается на вызове: DATA_DIR подменяют тесты."""
+    return pathlib.Path(DATA_DIR) / HEARTBEAT_NAME
+
+
+def write_heartbeat(status, now=None, reason=None):
+    """Оставить отметку о завершении прогона. Никогда не поднимает исключение.
+
+    Служебная запись не имеет права стоить дайджеста: любая ошибка здесь —
+    предупреждение в лог, а не падение прогона.
+    """
+    try:
+        now = now or dt.datetime.now(dt.timezone.utc)
+        payload = {
+            # Отметка называет себя: монитор с опечаткой в пути иначе может
+            # набрести на чужой валидный JSON со `status` внутри и замолчать
+            # навсегда, выглядя при этом исправным.
+            "service": SERVICE_NAME,
+            "status": status,
+            # Возраст монитор считает по ЭТОМУ полю, а не по mtime файла: mtime
+            # переживает cp -p и rsync, то есть врёт при переносе состояния.
+            "finished_at": now.astimezone(dt.timezone.utc)
+                              .strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "digest_date": now.date().isoformat(),
+        }
+        if reason:
+            # Тот же санитайзер, что у алёрта: в тексте исключения от провайдера
+            # легко оказывается URL с ключом в query.
+            payload["reason"] = sanitize_alert(str(reason))[:MAX_REASON_CHARS]
+        _atomic_write_json(heartbeat_path(), payload)
+    except Exception as e:                          # noqa: BLE001
+        log.warning("не удалось записать heartbeat (%s) — прогон это не ломает",
+                    type(e).__name__)
 
 
 # ---------- блокировка -------------------------------------------------------
@@ -339,7 +390,7 @@ def run(now=None, force=False, dry_run=False):
     # DATA_DIR и тесты не пишут в рабочий репозиторий.
     lock_path = data_dir / "run.lock"
     if not acquire_lock(now, path=lock_path):
-        return 2
+        return LOCK_BUSY_CODE
 
     try:
         history = History(data_dir / "sent_history.json")
@@ -474,8 +525,13 @@ def main(argv=None):
         now = now.replace(tzinfo=dt.timezone.utc)   # naive-отметки портят журнал
 
     try:
-        return run(now=now, force=args.force, dry_run=args.dry_run)
+        rc = run(now=now, force=args.force, dry_run=args.dry_run)
     except Exception as e:                          # noqa: BLE001
+        # Heartbeat — ПЕРВЫМ делом: всё остальное в этой ветке ходит по сети
+        # (Sentry, алёрт) и может не дойти, а исход прогона потерять нельзя.
+        if not args.dry_run:
+            write_heartbeat("failure", now=now,
+                            reason=f"{type(e).__name__}: {e}")
         log.exception("прогон упал")
         try:
             import sentry_sdk
@@ -488,6 +544,16 @@ def main(argv=None):
         # когда уведомление нужнее всего.
         _try_alert(f"⚠️ Дайджест не отправлен.\n{type(e).__name__}: {e}")
         return 1
+
+    # Провал без исключения — это тоже провал: `run` возвращает 1 (в пост влезло
+    # меньше минимума блоков) и 3 (неразрешённое намерение), и оба означают, что
+    # утром поста не будет. Код 2 пропускаем осознанно: он значит «работает ДРУГОЙ
+    # прогон», чужой исход этому процессу неизвестен, а свой ещё не наступил.
+    if not args.dry_run and rc != LOCK_BUSY_CODE:
+        write_heartbeat(
+            "success" if rc == 0 else "failure", now=now,
+            reason=None if rc == 0 else f"прогон завершился кодом {rc}")
+    return rc
 
 
 if __name__ == "__main__":

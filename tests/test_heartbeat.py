@@ -63,6 +63,9 @@ def test_successful_run_writes_success_heartbeat(env):
     assert beat is not None, "успешный прогон не оставил heartbeat — монитор ослеп"
     assert beat["status"] == "success"
     assert beat["digest_date"] == "2026-08-13"
+    # Отметка обязана назвать себя: иначе опечатка в пути на стороне монитора
+    # приведёт его к чужому валидному JSON, и чек замолчит, выглядя исправным.
+    assert beat["service"] == "ai-dev-daily"
 
     finished = dt.datetime.fromisoformat(beat["finished_at"].replace("Z", "+00:00"))
     assert finished.tzinfo is not None, "время без зоны — возраст посчитается неверно"
@@ -176,6 +179,14 @@ def test_heartbeat_write_failure_does_not_break_run(env, monkeypatch):
     assert run_daily.main(["--now", NOW.isoformat()]) == 0, \
         "сломанная запись heartbeat уронила успешный прогон"
     assert len(sent) == 1, "пост не ушёл из-за проблемы со служебным файлом"
+
+    # Проглотить ошибку молча тоже нельзя: сломанный heartbeat = ослепший монитор.
+    # Читаем реальный файл лога, а не caplog: basicConfig(force=True) в main()
+    # сносит хендлер pytest, и caplog покажет пусто при исправном логировании.
+    log_text = (pathlib.Path(data_dir) / "run_daily.log").read_text(encoding="utf-8")
+    assert "отправлено" in log_text, "предусловие: лог прогона непустой и пишется"
+    assert "heartbeat" in log_text.lower(), \
+        "сбой записи heartbeat не оставил следа в логе"
 
 
 # --- Критерий 6: атомарность и абсолютный путь ------------------------------

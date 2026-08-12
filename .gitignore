@@ -11,6 +11,7 @@ research/
 logs/
 data/digest-*.json
 data/run.lock
+data/heartbeat.json
 data/*.corrupt
 
 # Python
