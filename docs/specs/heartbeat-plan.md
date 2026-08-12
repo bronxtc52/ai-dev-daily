@@ -21,8 +21,9 @@ TypeScript-сторож) в двух репо; риск-триггер: прав
 **A1. `pipeline/run_daily.py`: запись heartbeat.**
 Функция `write_heartbeat(status, digest_date, reason=None)`:
 - пишет `DATA_DIR/heartbeat.json` через существующий атомарный путь (`.tmp` + `os.replace`);
-- поля: `status` (`success`/`failure`), `finished_at` (UTC ISO-8601, `Z`), `digest_date`,
-  `reason` (только для failure, прогнан через санитайзер секретов);
+- поля: **`service="ai-dev-daily"`** (подпись отметки — без неё монитор примет чужой
+  валидный JSON за нашу), `status` (`success`/`failure`), `finished_at` (UTC ISO-8601
+  с долями секунды), `digest_date`, `reason` (только для failure, через санитайзер);
 - **весь вызов в своём `try/except`** — heartbeat не имеет права уронить прогон (критерий 5);
 - в `--dry-run` не вызывается вовсе (критерий 3).
 

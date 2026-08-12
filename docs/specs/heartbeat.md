@@ -28,8 +28,9 @@ heartbeat-файл, отдельный коллектор сторожа про�
 ai-dev-daily/run_daily.py            server-watchdog (cron 0 */6 * * *)
   успех  ─┐                            collectors/aiDevDailyHeartbeat.ts
   падение ┴─► data/heartbeat.json  ──►   ├─ файла нет / старше 24 ч → warning
-             {status, finished_at,       ├─ свежий, но status=failure → warning
-              digest_date, reason}       └─ свежий success            → тишина
+             {service, status,           ├─ свежий, но status=failure → warning
+              finished_at, digest_date,  ├─ чужой service / битое     → warning
+              reason}                    └─ свежий success            → тишина
 ```
 
 ### Порог: 24 ч (арифметика, а не круглое число)

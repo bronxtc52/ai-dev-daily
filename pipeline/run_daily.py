@@ -7,6 +7,7 @@
 - намерение отправить пишется до отправки, чтобы падение не дало дубль утром.
 """
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import html
@@ -203,17 +204,80 @@ def heartbeat_path():
     return pathlib.Path(DATA_DIR) / HEARTBEAT_NAME
 
 
-def _heartbeat_is_newer_than(finished_at):
-    """Уже лежащая отметка новее нашей? Нечитаемую считаем устаревшей — перезапишем.
+HEARTBEAT_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+HEARTBEAT_LOCK_ATTEMPTS = 20        # ~0.2 c суммарно: дольше ждать нечего, файл крошечный
+HEARTBEAT_STATUSES = ("success", "failure")
 
-    Сравнение строкой корректно, потому что формат фиксированный и всегда UTC
-    (`%Y-%m-%dT%H:%M:%SZ`): лексикографический порядок совпадает с хронологическим.
+
+def _parse_heartbeat_time(value):
+    """Время из отметки как datetime; None — если это не наше время."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return dt.datetime.strptime(value, HEARTBEAT_TIME_FORMAT).replace(
+            tzinfo=dt.timezone.utc)
+    except ValueError:
+        try:                                        # отметки прежнего формата, без долей
+            return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=dt.timezone.utc)
+        except ValueError:
+            return None
+
+
+def _existing_heartbeat_is_newer(finished_at):
+    """Лежит ли на месте ВАЛИДНАЯ отметка более позднего прогона.
+
+    Сравнивать сырые строки нельзя: `{"finished_at": "z"}` лексикографически
+    больше любой даты, и одна такая запись запретила бы обновление НАВСЕГДА —
+    сторож остался бы в ошибке навечно. Залипание хуже гонки, от которой
+    защищаемся, поэтому «сохраняем чужое» только если чужое — действительно
+    наша отметка: своё имя сервиса, известный статус, разбираемое время.
     """
     try:
         current = json.loads(heartbeat_path().read_text(encoding="utf-8"))
-        return str(current.get("finished_at", "")) > str(finished_at)
     except Exception:                               # noqa: BLE001
+        return False                                # нет файла или мусор — пишем поверх
+    if not isinstance(current, dict):
         return False
+    if current.get("service") != SERVICE_NAME:
+        return False
+    if current.get("status") not in HEARTBEAT_STATUSES:
+        return False
+    theirs = _parse_heartbeat_time(current.get("finished_at"))
+    ours = _parse_heartbeat_time(finished_at)
+    if theirs is None or ours is None:
+        return False
+    return theirs > ours
+
+
+@contextlib.contextmanager
+def _heartbeat_write_lock():
+    """Сериализовать «прочитать-сравнить-записать».
+
+    Проверка и запись — две операции, между ними другой прогон успевает
+    записаться, и мы затираем его результат уже после сравнения. Лок
+    best-effort: не досталась — всё равно пишем (тишина монитора дороже
+    редкой гонки), но большинство наложений он разводит.
+    """
+    lock = heartbeat_path().with_name(HEARTBEAT_NAME + ".lock")
+    fd = None
+    for _ in range(HEARTBEAT_LOCK_ATTEMPTS):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            time.sleep(0.01)
+        except OSError:
+            break                                   # каталог недоступен — не наша беда
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
 
 
 def write_heartbeat(status, now=None, reason=None):
@@ -232,8 +296,10 @@ def write_heartbeat(status, now=None, reason=None):
             "status": status,
             # Возраст монитор считает по ЭТОМУ полю, а не по mtime файла: mtime
             # переживает cp -p и rsync, то есть врёт при переносе состояния.
+            # Доли секунды обязательны: два прогона в одной секунде иначе
+            # неразличимы по времени, и порядок завершений теряется.
             "finished_at": now.astimezone(dt.timezone.utc)
-                              .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                              .strftime(HEARTBEAT_TIME_FORMAT),
             "digest_date": now.date().isoformat(),
         }
         if reason:
@@ -246,11 +312,11 @@ def write_heartbeat(status, now=None, reason=None):
         # очнётся и затрёт успех более позднего ретрая. Сторож поднял бы тревогу
         # по несуществующей поломке, а причину искали бы в сервисе. Отметка обязана
         # представлять последний ЗАВЕРШИВШИЙСЯ прогон, поэтому старую не откатываем.
-        if _heartbeat_is_newer_than(payload["finished_at"]):
-            log.info("heartbeat не тронут: на месте отметка более позднего прогона")
-            return
-
-        _atomic_write_json(heartbeat_path(), payload)
+        with _heartbeat_write_lock():
+            if _existing_heartbeat_is_newer(payload["finished_at"]):
+                log.info("heartbeat не тронут: на месте отметка более позднего прогона")
+                return
+            _atomic_write_json(heartbeat_path(), payload)
     except Exception as e:                          # noqa: BLE001
         log.warning("не удалось записать heartbeat (%s) — прогон это не ломает",
                     type(e).__name__)

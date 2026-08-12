@@ -330,5 +330,60 @@ def test_heartbeat_uses_the_in_lock_timestamp(env, monkeypatch):
     monkeypatch.setattr(run_daily, "run", fake_run)
     run_daily.main([])
 
-    assert hb(data_dir)["finished_at"] == "2026-08-13T04:00:05Z", \
+    assert hb(data_dir)["finished_at"] == "2026-08-13T04:00:05.000000Z", \
         "записан момент записи, а не момент завершения под lock'ом"
+
+
+# --- Находки CodeRabbit (PR #3, 🟠 Major): защита не должна залипать ---------
+
+def test_corrupt_existing_heartbeat_is_replaced(env):
+    """Битая отметка не имеет права запретить запись навсегда.
+
+    Строковое сравнение делает `{"finished_at":"z"}` больше любой валидной
+    даты: все здоровые прогоны пропускали бы запись, и сторож остался бы в
+    ошибке навечно — залипание страшнее гонки, от которой защищались.
+    """
+    data_dir, _ = env
+    (pathlib.Path(data_dir) / "heartbeat.json").write_text(
+        json.dumps({"finished_at": "z"}), encoding="utf-8")
+
+    run_daily.write_heartbeat("success", now=NOW)
+
+    beat = hb(data_dir)
+    assert beat["status"] == "success", "битая отметка заблокировала запись навсегда"
+    assert beat["service"] == "ai-dev-daily"
+
+
+def test_foreign_existing_heartbeat_is_replaced(env):
+    """Чужая отметка по нашему пути тоже не должна нас блокировать."""
+    data_dir, _ = env
+    (pathlib.Path(data_dir) / "heartbeat.json").write_text(
+        json.dumps({"service": "чужой-сервис", "status": "success",
+                    "finished_at": "2099-01-01T00:00:00Z"}), encoding="utf-8")
+
+    run_daily.write_heartbeat("failure", now=NOW, reason="повод")
+    assert hb(data_dir)["service"] == "ai-dev-daily", "чужая отметка заблокировала нашу"
+
+
+def test_unparsable_existing_timestamp_is_replaced(env):
+    """Нечитаемое время у лежащей отметки = она устарела, а не «свежее всех»."""
+    data_dir, _ = env
+    (pathlib.Path(data_dir) / "heartbeat.json").write_text(
+        json.dumps({"service": "ai-dev-daily", "status": "success",
+                    "finished_at": "вчера вечером"}), encoding="utf-8")
+
+    run_daily.write_heartbeat("success", now=NOW)
+    assert hb(data_dir)["finished_at"].startswith("2026-08-13T04:00")
+
+
+def test_two_runs_in_the_same_second_are_ordered(env):
+    """Секундной точности мало: два прогона в одной секунде неразличимы."""
+    data_dir, _ = env
+    first = NOW
+    second = NOW + dt.timedelta(microseconds=500000)
+
+    run_daily.write_heartbeat("success", now=second)   # завершился позже
+    run_daily.write_heartbeat("failure", now=first)    # завершился раньше, пишет позже
+
+    assert hb(data_dir)["status"] == "success", \
+        "в пределах одной секунды порядок завершений потерян"
