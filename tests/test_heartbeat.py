@@ -204,3 +204,36 @@ def test_heartbeat_write_is_atomic_and_leaves_no_temp(env):
 def test_heartbeat_path_is_absolute_and_cwd_independent(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)                     # cron стартует не из репозитория
     assert pathlib.Path(run_daily.heartbeat_path()).is_absolute()
+
+
+# --- Семантика finished_at (вопрос внешнего ревью диффа) --------------------
+
+def test_finished_at_is_write_time_in_production(env, monkeypatch):
+    """Без --now отметка несёт РЕАЛЬНОЕ время завершения, а не время старта.
+
+    Ревью диффа заподозрило, что main() фиксирует `now` один раз и передаёт его
+    же в heartbeat, то есть отметка врёт на длительность прогона. В проде флага
+    --now нет, `now` остаётся None, и время берётся в момент записи. Проверяем
+    это, а не читаем код глазами: на нём стоит вся арифметика порога 24 ч.
+    """
+    data_dir, _ = env
+    before = dt.datetime.now(dt.timezone.utc)
+    assert run_daily.main([]) == 0                      # ровно так зовёт cron
+    after = dt.datetime.now(dt.timezone.utc)
+
+    beat = hb(data_dir)
+    finished = dt.datetime.fromisoformat(beat["finished_at"].replace("Z", "+00:00"))
+    assert before.replace(microsecond=0) <= finished <= after + dt.timedelta(seconds=1), \
+        "finished_at не совпал с моментом записи — порог свежести поедет"
+
+
+def test_now_flag_is_debug_only_and_marks_the_beat(env):
+    """--now подменяет и отметку тоже. Осознанно: флаг только для отладки.
+
+    Тест фиксирует поведение, чтобы «боевой прогон с --now» не выглядел
+    безобидным: отметка получит поддельное время и обманет монитор.
+    """
+    data_dir, _ = env
+    past = dt.datetime(2026, 1, 1, 4, 0, tzinfo=dt.timezone.utc)
+    run_daily.main(["--now", past.isoformat()])
+    assert hb(data_dir)["finished_at"].startswith("2026-01-01")
