@@ -187,6 +187,12 @@ class SecretRedactingFilter(logging.Filter):
 # Пишем на ЗАВЕРШЕНИЕ и только в боевом режиме: dry-run обновлял бы отметку
 # свежести, и ручная отладка вечером маскировала бы пропущенное утро.
 
+# Момент завершения прогона, снятый ПОКА ДЕРЖИМ lock. Именно lock задаёт порядок
+# завершений, поэтому штамп, снятый после его освобождения, этот порядок не отражает:
+# вытесненный с CPU прогон очнулся бы позже чужой записи, получил бы более поздний
+# штамп и на законных основаниях затёр более свежий исход.
+_LAST_COMPLETION = {}
+
 HEARTBEAT_NAME = "heartbeat.json"
 SERVICE_NAME = "ai-dev-daily"    # подпись отметки: чужой JSON не сойдёт за нашу
 MAX_REASON_CHARS = 500          # причина — для человека в алёрте, не лог целиком
@@ -516,6 +522,9 @@ def run(now=None, force=False, dry_run=False):
                  len(digest["blocks"]), resp.get("message_id"))
         return 0
     finally:
+        # Штамп — до освобождения lock: пока он наш, ни один другой прогон не мог
+        # завершиться, значит порядок штампов совпадает с порядком завершений.
+        _LAST_COMPLETION["at"] = dt.datetime.now(dt.timezone.utc)
         release_lock(lock_path)
 
 
@@ -550,10 +559,11 @@ def main(argv=None):
     try:
         rc = run(now=now, force=args.force, dry_run=args.dry_run)
     except Exception as e:                          # noqa: BLE001
-        # Момент ЗАВЕРШЕНИЯ, а не записи: lock уже отпущен, и порядок записи может
-        # разойтись с порядком завершения. Отметка сравнивается по этому полю, так
-        # что штамп обязан относиться к концу прогона, иначе защита от отката пустая.
-        finished = dt.datetime.now(dt.timezone.utc)
+        # Штамп берём тот, что снят под lock'ом внутри run(). Свой здесь снимать
+        # нельзя: между освобождением lock и этой строкой чужой прогон мог успеть
+        # завершиться и записаться, а более поздний штамп дал бы нам право его
+        # затереть — ровно тот откат, от которого защищаемся.
+        finished = _LAST_COMPLETION.get("at") or dt.datetime.now(dt.timezone.utc)
         # Heartbeat — ПЕРВЫМ делом: всё остальное в этой ветке ходит по сети
         # (Sentry, алёрт) и может не дойти, а исход прогона потерять нельзя.
         if not args.dry_run:
@@ -576,7 +586,7 @@ def main(argv=None):
     # меньше минимума блоков) и 3 (неразрешённое намерение), и оба означают, что
     # утром поста не будет. Код 2 пропускаем осознанно: он значит «работает ДРУГОЙ
     # прогон», чужой исход этому процессу неизвестен, а свой ещё не наступил.
-    finished = dt.datetime.now(dt.timezone.utc)
+    finished = _LAST_COMPLETION.get("at") or dt.datetime.now(dt.timezone.utc)
     if not args.dry_run and rc != LOCK_BUSY_CODE:
         write_heartbeat(
             "success" if rc == 0 else "failure", now=now or finished,

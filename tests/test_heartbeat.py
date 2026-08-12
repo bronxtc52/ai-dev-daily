@@ -17,6 +17,18 @@ import run_daily
 NOW = dt.datetime(2026, 8, 13, 4, 0, tzinfo=dt.timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def clean_completion_stamp():
+    """Штамп завершения живёт в модуле и течёт между тестами.
+
+    Без сброса проверка «штамп снят под lock» зелена от чужого прогона —
+    ровно такая холостая проверка и не покраснела на мутации.
+    """
+    run_daily._LAST_COMPLETION.clear()
+    yield
+    run_daily._LAST_COMPLETION.clear()
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """Изолированный прогон с фейковой сетью — как в test_run_daily."""
@@ -281,3 +293,42 @@ def test_temp_file_name_is_unique_per_process(env, monkeypatch):
     assert seen, "предусловие: запись действительно шла через os.replace"
     assert str(run_daily.os.getpid()) in seen[0], \
         f"общее имя временного файла у конкурирующих процессов: {seen[0]}"
+
+
+def test_completion_time_is_taken_while_holding_the_lock(env, monkeypatch):
+    """Порядок завершения задаётся lock'ом, значит и штамп снимать под ним.
+
+    Иначе защита от отката пустая: вытесненный прогон очнётся уже после
+    чужой записи, возьмёт СВОЙ штамп позже чужого и на законных основаниях
+    затрёт более свежий исход (находка Codex на PR #3).
+    """
+    data_dir, _ = env
+    seen = {}
+    real_release = run_daily.release_lock
+    monkeypatch.setattr(
+        run_daily, "release_lock",
+        lambda path=None: seen.update(stamp=run_daily._LAST_COMPLETION.get("at"))
+        or real_release(path))
+
+    assert run_daily._LAST_COMPLETION.get("at") is None, \
+        "предусловие: до прогона штампа нет, иначе проверка холостая"
+    run_daily.main([])
+
+    assert seen.get("stamp") is not None, \
+        "штамп снят уже после освобождения lock — порядок завершения не зафиксирован"
+
+
+def test_heartbeat_uses_the_in_lock_timestamp(env, monkeypatch):
+    """main() обязан писать именно тот момент, что зафиксирован под lock'ом."""
+    data_dir, _ = env
+    inside = dt.datetime(2026, 8, 13, 4, 0, 5, tzinfo=dt.timezone.utc)
+
+    def fake_run(**kwargs):
+        run_daily._LAST_COMPLETION["at"] = inside      # как это делает настоящий run()
+        return 0
+
+    monkeypatch.setattr(run_daily, "run", fake_run)
+    run_daily.main([])
+
+    assert hb(data_dir)["finished_at"] == "2026-08-13T04:00:05Z", \
+        "записан момент записи, а не момент завершения под lock'ом"
