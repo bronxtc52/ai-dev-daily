@@ -1,0 +1,35 @@
+# Ротация логов ai-dev-daily.
+#
+# Ставится на mh-central как /etc/logrotate.d/ai-dev-daily:
+#   sudo install -m 0644 -o root -g root ops/logrotate-ai-dev-daily \
+#        /etc/logrotate.d/ai-dev-daily
+#   sudo logrotate --debug /etc/logrotate.d/ai-dev-daily   # проверка без правки
+#
+# Держим в репозитории, а не только на хосте: правило, живущее одной копией в
+# /etc, невозможно ни отревьюить, ни восстановить после переустановки машины.
+#
+# Два файла, потому что путей вывода два: приложение пишет свой лог, а cron
+# отдельно перенаправляет stdout/stderr — второй канал ловит то, что упало
+# ДО настройки логгера (сломанный venv, отсутствующий интерпретатор), и без
+# ротации он растёт ровно так же.
+#
+# Процессы короткоживущие и файл между прогонами никем не открыт, поэтому
+# обычный rotate безопасен: copytruncate с его окном потери строк не нужен.
+
+/home/azureuser/logs/ai-dev-daily.log
+/home/azureuser/projects/ai-dev-daily/logs/run_daily.log {
+    weekly
+    # Квартал истории: достаточно, чтобы разобрать инцидент задним числом.
+    # ⚠️ Комментарий в КОНЦЕ строки директивы logrotate не понимает — он
+    # читает его как часть значения и отбрасывает правило целиком, молча
+    # (ошибка видна только в `logrotate --debug`). Поэтому комментарии здесь
+    # стоят исключительно отдельными строками.
+    rotate 12
+    compress
+    delaycompress
+    # Лог может ещё не появиться — это не повод шуметь.
+    missingok
+    notifempty
+    create 0644 azureuser azureuser
+    su azureuser azureuser
+}
