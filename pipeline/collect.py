@@ -134,22 +134,30 @@ def build_queries(since_date):
     }
 
 
-def gather(sources, queries):
+def gather(sources, queries, stats=None):
     """Собрать кандидатов со всех источников.
 
     Падение одного источника не отменяет утренний дайджест — работаем на
     частичных данных. Но если не выжил ни один, отправлять нечего: это ошибка.
+
+    `stats` (если передан) заполняется числом материалов ПО КАЖДОМУ источнику.
+    Суммарного количества для наблюдения недостаточно: смерть одного источника
+    из трёх даёт просто число поменьше, а «поменьше» неотличимо от спокойного
+    дня в новостях. Именно поэтому такой отказ и проходил молча.
     """
     out = []
     alive = 0
     for name, fn in sources.items():
         source_ok = False
+        before = len(out)
         for q in queries.get(name, []):
             try:
                 out.extend(fn(q))
                 source_ok = True
             except Exception as e:                  # noqa: BLE001
                 log.warning("источник %s: запрос отброшен (%s)", name, type(e).__name__)
+        if stats is not None:
+            stats[name] = len(out) - before
         if source_ok:
             alive += 1
 
@@ -158,7 +166,37 @@ def gather(sources, queries):
     return out
 
 
-def collect_candidates(now=None, days=DEFAULT_WINDOW_DAYS):
+def github_token_expiry():
+    """Когда истекает GitHub PAT, или None, если срок не объявлен.
+
+    GitHub сообщает срок заголовком `github-authentication-token-expiration`
+    на любом авторизованном ответе. Спрашиваем `/rate_limit`: он не тратит
+    квоту и не зависит от того, нашлось ли что-то по нашим запросам.
+
+    Бессрочный токен (classic PAT без даты) заголовка не отдаёт — это не
+    ошибка, а легитимное «срока нет», отсюда None вместо исключения.
+    """
+    token = secret("GITHUB_TOKEN")
+    req = urllib.request.Request(
+        "https://api.github.com/rate_limit",
+        headers={"Authorization": f"token {token}",
+                 "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+        raw = r.headers.get("github-authentication-token-expiration")
+    if not raw:
+        return None
+    # Формат заголовка — '2026-11-20 10:30:00 UTC' либо ISO; принимаем оба,
+    # потому что разбор чужого формата не должен решать судьбу проверки.
+    text = raw.strip().replace(" UTC", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        log.warning("срок GitHub-токена не разобран — проверка пропущена")
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def collect_candidates(now=None, days=DEFAULT_WINDOW_DAYS, stats=None):
     """Точка входа для оркестратора."""
     now = now or datetime.now(timezone.utc)
     since = window_start(now, days)
@@ -170,8 +208,11 @@ def collect_candidates(now=None, days=DEFAULT_WINDOW_DAYS):
         "exa": lambda q: with_retry(lambda: exa_search(q, since_date=since)),
         "github": lambda q: with_retry(lambda: github_search(q)),
     }
-    cands = gather(sources, queries)
+    cands = gather(sources, queries, stats=stats)
     log.info("собрано кандидатов: %d (окно с %s)", len(cands), since)
+    if stats:
+        log.info("по источникам: %s",
+                 ", ".join(f"{k}={v}" for k, v in sorted(stats.items())))
     return cands
 
 

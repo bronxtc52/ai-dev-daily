@@ -22,6 +22,7 @@ import time
 import urllib.parse
 import urllib.request
 
+import collect
 from collect import collect_candidates
 import config
 from config import secret
@@ -65,10 +66,34 @@ def send_telegram(text, disable_preview=True):
     return resp.get("result", {})
 
 
+def _optional_secret(key, fallback_key):
+    """Значение `key`, а если он не настроен — значение `fallback_key`.
+
+    Отсутствие ключа здесь — штатная конфигурация, а не поломка: пока адресат
+    аварий отдельно не задан, всё работает как раньше. Иначе выкат новой версии
+    до правки cron уронил бы именно контур уведомлений — тот, что обязан
+    сообщать о поломках.
+    """
+    try:
+        return secret(key)
+    except RuntimeError:
+        return secret(fallback_key)
+
+
 def send_alert(text):
-    """Короткое уведомление о сбое — обычным текстом, без разметки."""
-    token = secret("TELEGRAM_BOT_TOKEN")
-    chat = secret("TELEGRAM_CHAT_ID")
+    """Короткое уведомление о сбое — обычным текстом, без разметки.
+
+    Адресат — ВЛАДЕЛЕЦ, а не адресат дайджеста. Дайджест уходит в публичный
+    канал, и «⚠️ Дайджест не отправлен» на общем адресате увидели бы подписчики:
+    внутренняя авария стала бы публикацией.
+
+    Бот тоже может быть другим. Бот канала не обязан иметь право писать
+    владельцу в личку — Telegram запрещает боту первым писать пользователю,
+    пока тот не нажал Start, — и без этой развилки контур уведомлений зависел
+    бы от ручного действия человека.
+    """
+    token = _optional_secret("TELEGRAM_ALERT_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
+    chat = _optional_secret("TELEGRAM_ALERT_CHAT_ID", "TELEGRAM_CHAT_ID")
     data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/sendMessage", data=data)
@@ -413,6 +438,14 @@ def release_lock(path=None):
         _force_unlink(path)
 
 
+# Идёт ли ещё одна попытка прогона после текущей. Пока идёт, о неудаче
+# сообщать рано: инцидент, который через полчаса вылечится сам, не должен
+# будить человека трижды. Флаг модульный, а не параметр, потому что алёрт
+# шлют и вложенные помощники (_steal_if_stale), до которых аргумент пришлось
+# бы протаскивать через весь стек.
+_ALERTS_SUPPRESSED = {"value": False}
+
+
 def _try_alert(text, attempts=3, base_delay=2.0):
     """Уведомить, не роняя основной поток: доставка алёрта — best-effort.
 
@@ -422,6 +455,9 @@ def _try_alert(text, attempts=3, base_delay=2.0):
     именно в нём одна попытка почти наверняка потерялась бы.
     """
     safe = sanitize_alert(text)
+    if _ALERTS_SUPPRESSED["value"]:
+        log.info("алёрт отложен до последней попытки: %s", safe)
+        return False
     for i in range(attempts):
         try:
             send_alert(safe)
@@ -469,6 +505,142 @@ def _send_once_or_safely_retry(post, attempts=3, base_delay=2.0):
     raise RuntimeError("недостижимо")
 
 
+# ---------- журнал уведомлений ------------------------------------------------
+#
+# Отдельный от истории отправок файл: он отвечает не «что читатель уже видел»,
+# а «о чём мы уже говорили владельцу». Мёртвый источник остаётся мёртвым
+# неделями, и ежедневное сообщение об этом обесценивает канал алёртов целиком —
+# человек перестаёт их читать ровно к тому дню, когда случится настоящая авария.
+
+NOTICES_NAME = "notices.json"
+NOTICE_COOLDOWN_DAYS = 7
+DIGEST_RETENTION_DAYS = 90
+TOKEN_WARN_DAYS = 14
+
+
+def _load_notices(path):
+    try:
+        data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except Exception:                               # noqa: BLE001
+        return {}                                   # нет файла или мусор — начинаем заново
+    return data if isinstance(data, dict) else {}
+
+
+def should_notify(path, key, now, cooldown_days=NOTICE_COOLDOWN_DAYS):
+    """Пора ли снова говорить владельцу об этом же."""
+    stamp = _load_notices(path).get(key)
+    if not isinstance(stamp, str):
+        return True
+    try:
+        last = dt.datetime.fromisoformat(stamp)
+    except ValueError:
+        return True                                 # непонятная отметка — лучше сказать
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=dt.timezone.utc)
+    return (now - last) >= dt.timedelta(days=cooldown_days)
+
+
+def remember_notice(path, key, now):
+    """Отметить, что об этом уже сообщили. Никогда не роняет прогон."""
+    try:
+        data = _load_notices(path)
+        data[key] = now.isoformat()
+        _atomic_write_json(pathlib.Path(path), data)
+    except Exception:                               # noqa: BLE001
+        log.warning("не удалось записать журнал уведомлений — прогон это не ломает")
+
+
+def _notify_once(data_dir, key, text, now):
+    """Сообщить владельцу, если об этом давно не говорили."""
+    path = pathlib.Path(data_dir) / NOTICES_NAME
+    if not should_notify(path, key, now):
+        log.info("уведомление «%s» подавлено: недавно уже отправляли", key)
+        return False
+    if _try_alert(text):
+        remember_notice(path, key, now)
+        return True
+    return False
+
+
+def report_dead_sources(data_dir, stats, now):
+    """Сообщить о источниках, не давших НИ ОДНОГО материала.
+
+    Сбор устроен так, что смерть одного источника не отменяет дайджест — это
+    правильно для утреннего поста, но означает, что отказ виден только как
+    строка WARNING в логе, которую под cron никто не читает. Протухший токен
+    так может жить месяцами: пост выходит, просто беднее.
+    """
+    dead = sorted(name for name, count in (stats or {}).items() if not count)
+    if not dead:
+        return []
+    _notify_once(
+        data_dir, "source-dead:" + ",".join(dead),
+        f"⚠️ Источники молчат: {', '.join(dead)}. Дайджест вышел на остальных. "
+        f"Вероятная причина — протухший ключ или смена API.",
+        now)
+    return dead
+
+
+def check_token_expiry(data_dir, now, warn_days=TOKEN_WARN_DAYS):
+    """Предупредить о скором истечении GitHub PAT.
+
+    Единственный наш ключ, который объявляет свой срок. Остальные о нём
+    молчат, и их протухание ловится только детектом мёртвого источника —
+    то есть постфактум. Здесь узнаём заранее.
+
+    Проверка служебная: любая её ошибка — предупреждение в лог, не падение.
+    """
+    try:
+        expires = collect.github_token_expiry()
+        if expires is None:
+            return None
+        left = expires - now
+        if left > dt.timedelta(days=warn_days):
+            return left
+        _notify_once(
+            data_dir, f"token-expiry:github:{expires.date().isoformat()}",
+            f"🔑 GitHub-токен истекает {expires.date().isoformat()} "
+            f"(осталось дней: {max(left.days, 0)}). Обновите "
+            f"ai-dev-daily--prod--GITHUB-TOKEN в Key Vault, иначе источник "
+            f"GitHub замолчит.",
+            now)
+        return left
+    except Exception as e:                          # noqa: BLE001
+        log.warning("проверка срока токена не удалась (%s) — прогон это не ломает",
+                    type(e).__name__)
+        return None
+
+
+def prune_old_digests(data_dir, now, keep_days=DIGEST_RETENTION_DAYS):
+    """Убрать суточные снимки дайджеста старше окна хранения.
+
+    Один файл в день — за пять лет почти две тысячи штук. Сами по себе они
+    крошечные, но сервис, который должен жить годами без человека, не имеет
+    права бесконечно накапливать что бы то ни было.
+
+    Имя, которое не разбирается в дату, не трогаем: в каталоге лежат и чужие
+    файлы (ручной `digest-2026-07-19.md`), и удалять непонятное — худший из
+    возможных дефолтов для уборщика.
+    """
+    edge = (now - dt.timedelta(days=keep_days)).date()
+    removed = 0
+    for f in sorted(pathlib.Path(data_dir).glob("digest-*.json")):
+        stamp = f.stem[len("digest-"):]
+        try:
+            when = dt.date.fromisoformat(stamp)
+        except ValueError:
+            continue
+        if when < edge:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        log.info("убрано старых снимков дайджеста: %d", removed)
+    return removed
+
+
 # ---------- прогон -----------------------------------------------------------
 
 def _date_label(now):
@@ -504,10 +676,19 @@ def run(now=None, force=False, dry_run=False):
                            "Проверьте канал; повтор — с флагом --force.")
                 return 3
 
-        candidates = collect_candidates(now=now)
+        # Счётчики по источникам собираем ВСЕГДА: без них отказ одного из трёх
+        # выглядит просто как более скромный день в новостях.
+        source_stats = {}
+        candidates = collect_candidates(now=now, stats=source_stats)
         seen = history.seen_urls(now)
         fresh = history.filter_new(candidates, now=now)
         log.info("кандидатов: %d, после дедупа: %d", len(candidates), len(fresh))
+
+        # Сразу после сбора, а не в конце: мёртвый источник — самая вероятная
+        # причина того, что дальше не наберётся блоков, и знать о нём надо
+        # даже в прогоне, который до отправки не дойдёт.
+        if not dry_run:
+            report_dead_sources(data_dir, source_stats, now)
 
         # seen передаём внутрь: Perplexity добирает материалы уже после этого
         # фильтра, и без второй проверки они минуют дедуп целиком.
@@ -586,6 +767,14 @@ def run(now=None, force=False, dry_run=False):
 
         log.info("отправлено: %d блоков, message_id=%s",
                  len(digest["blocks"]), resp.get("message_id"))
+
+        # Обслуживание — строго ПОСЛЕ отправки и в своём try: уборка мусора и
+        # проверка срока токена не имеют права стоить уже состоявшегося утра.
+        try:
+            prune_old_digests(data_dir, now)
+            check_token_expiry(data_dir, now)
+        except Exception:                           # noqa: BLE001
+            log.warning("обслуживание после отправки не отработало полностью")
         return 0
     finally:
         # Штамп — до освобождения lock: пока он наш, ни один другой прогон не мог
@@ -601,7 +790,18 @@ def main(argv=None):
     p.add_argument("--force", action="store_true",
                    help="отправить, даже если сегодня уже отправляли")
     p.add_argument("--now", help="переопределить текущее время (ISO), для отладки")
+    p.add_argument("--attempt", type=int, default=1,
+                   help="номер попытки за сегодня (cron делает несколько заходов)")
+    p.add_argument("--attempts", type=int, default=1,
+                   help="сколько всего попыток запланировано на сегодня")
     args = p.parse_args(argv)
+
+    # Последняя попытка отвечает за громкость: только она будит человека и
+    # только она фиксирует провал в heartbeat. Промежуточная делает то же
+    # самое молча — иначе один инцидент даёт три алёрта, а отметка `failure`
+    # заставляет сторож сообщать о поломке, которая через полчаса вылечится.
+    is_final = args.attempt >= args.attempts
+    _ALERTS_SUPPRESSED["value"] = not is_final
 
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
@@ -632,7 +832,11 @@ def main(argv=None):
         finished = _LAST_COMPLETION.get("at") or dt.datetime.now(dt.timezone.utc)
         # Heartbeat — ПЕРВЫМ делом: всё остальное в этой ветке ходит по сети
         # (Sentry, алёрт) и может не дойти, а исход прогона потерять нельзя.
-        if not args.dry_run:
+        # Но только на последней попытке: промежуточный `failure` сторож читает
+        # как состоявшуюся поломку. Отметка при этом не подделывается — она
+        # просто остаётся прежней, и если следующая попытка не состоится вовсе,
+        # сторож честно увидит протухшую отметку и сообщит об этом.
+        if not args.dry_run and is_final:
             write_heartbeat("failure", now=now or finished,
                             reason=f"{type(e).__name__}: {e}")
         log.exception("прогон упал")
@@ -653,7 +857,9 @@ def main(argv=None):
     # утром поста не будет. Код 2 пропускаем осознанно: он значит «работает ДРУГОЙ
     # прогон», чужой исход этому процессу неизвестен, а свой ещё не наступил.
     finished = _LAST_COMPLETION.get("at") or dt.datetime.now(dt.timezone.utc)
-    if not args.dry_run and rc != LOCK_BUSY_CODE:
+    # Успех отмечаем всегда — он окончателен, дальнейшие попытки его не изменят
+    # (и просто выйдут по идемпотентности). Провал — только на последней.
+    if not args.dry_run and rc != LOCK_BUSY_CODE and (rc == 0 or is_final):
         write_heartbeat(
             "success" if rc == 0 else "failure", now=now or finished,
             reason=None if rc == 0 else f"прогон завершился кодом {rc}")

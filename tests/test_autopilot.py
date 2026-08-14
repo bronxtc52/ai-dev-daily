@@ -51,9 +51,19 @@ def captured_calls(monkeypatch):
 
 
 def _set_secrets(monkeypatch, **kw):
-    """Подменить разрешение секретов, не трогая Key Vault."""
-    monkeypatch.setattr(config, "secret", lambda key: kw[key])
-    monkeypatch.setattr(run_daily, "secret", lambda key: kw[key])
+    """Подменить разрешение секретов, не трогая Key Vault.
+
+    Ненастроенный ключ обязан давать RuntimeError — ровно то, что бросает
+    настоящий config.secret. Подмена, падающая KeyError, проверяла бы не тот
+    контракт: ветка fallback ловит именно RuntimeError.
+    """
+    def fake(key):
+        if key not in kw:
+            raise RuntimeError(f"{key}: не настроен")
+        return kw[key]
+
+    monkeypatch.setattr(config, "secret", fake)
+    monkeypatch.setattr(run_daily, "secret", fake)
 
 
 def test_alert_goes_to_owner_not_to_channel(monkeypatch, captured_calls):
