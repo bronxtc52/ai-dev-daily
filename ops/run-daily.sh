@@ -33,5 +33,21 @@ set -a; source "$ENV_FILE"; set +a
 # в неожиданном месте (в первую очередь — `az` без интерактивной сессии).
 # Висящий процесс держит lock и молча съедает утро: следующий заход увидит
 # живого владельца lock и по правилу не станет его отбирать.
-exec timeout --signal=TERM --kill-after=60s 15m \
+#
+# SIGTERM прогон обрабатывает сам (install_termination_handler): пишет отметку
+# failure и шлёт алёрт обычным путём. Минуты до KILL на это хватает.
+#
+# Без `exec` намеренно: нужно увидеть статус. Если дело всё-таки дошло до
+# неперехватываемого KILL, записать исход уже некому — и тогда единственный
+# след останется здесь, в логе. Молчание в этом месте выглядело бы как
+# нормальное завершение.
+set +e
+timeout --signal=TERM --kill-after=60s 15m \
   "$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/pipeline/run_daily.py" "$@"
+status=$?
+set -e
+
+if [[ $status -eq 124 || $status -eq 137 ]]; then
+  echo "ai-dev-daily: прогон снят по таймауту (код $status)" >&2
+fi
+exit "$status"
