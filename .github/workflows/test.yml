@@ -21,6 +21,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          # По умолчанию checkout оставляет токен в локальном git-конфиге, а
+          # дальше шаги выполняют код ИЗ САМОГО pull request (pip, pytest).
+          # На форк-PR это отдало бы токен чужому коду. Git-аутентификация
+          # тут не нужна ни одному шагу.
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:

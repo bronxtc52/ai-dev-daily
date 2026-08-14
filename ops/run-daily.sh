@@ -47,7 +47,13 @@ timeout --signal=TERM --kill-after=60s 15m \
 status=$?
 set -e
 
-if [[ $status -eq 124 || $status -eq 137 ]]; then
-  echo "ai-dev-daily: прогон снят по таймауту (код $status)" >&2
+# 124 — timeout сам сообщает, что убил команду по истечении срока.
+# 137 — процесс получил SIGKILL, но НЕ обязательно от нас: так же выглядит
+# OOM-killer или ручной `kill -9`. Причину отсюда не различить, поэтому
+# формулировка нейтральная — врать про таймаут хуже, чем сказать «снят».
+if [[ $status -eq 124 ]]; then
+  echo "ai-dev-daily: прогон снят по таймауту (код 124)" >&2
+elif [[ $status -eq 137 ]]; then
+  echo "ai-dev-daily: прогон убит сигналом KILL (код 137) — таймаут, OOM или kill -9" >&2
 fi
 exit "$status"
