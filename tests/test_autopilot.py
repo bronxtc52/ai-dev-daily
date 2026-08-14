@@ -244,6 +244,62 @@ def test_sigterm_is_reported_like_a_failure(failing_env, monkeypatch):
     assert hb["status"] == "failure"
 
 
+def test_sigterm_is_not_swallowed_by_source_retries(monkeypatch):
+    """SIGTERM обязан проходить СКВОЗЬ ретраи и частичную деградацию сбора.
+
+    Находка CodeRabbit на PR #7 (Major). `Terminated` наследовался от
+    `Exception`, а сбор ловит `Exception` дважды: `with_retry` повторяет
+    вызов, а `gather` списывает запрос в «отброшен» и идёт дальше. Снятие по
+    таймауту таким образом проглатывалось целиком, прогон продолжался как ни
+    в чём не бывало, и внешний timeout снова становился бесполезным — то есть
+    предыдущий фикс не работал вовсе.
+    """
+    def terminated(_q):
+        raise run_daily.Terminated("снят сигналом")
+
+    with pytest.raises(run_daily.Terminated):
+        collect.gather(sources={"x": terminated}, queries={"x": ["q"]})
+
+
+def test_informational_notices_survive_alert_suppression(tmp_path, monkeypatch):
+    """Подавление на непоследней попытке не должно глушить наблюдения.
+
+    Находка CodeRabbit на PR #7 (Major). `_ALERTS_SUPPRESSED` гасил ЛЮБОЙ
+    вызов `_try_alert`, включая уведомления о мёртвом источнике и сроке
+    токена. В боевом расписании прогон идёт с `--attempt 1 --attempts 3`,
+    успешно отправляет дайджест на первой же попытке, а попытки 2 и 3 выходят
+    раньше сбора по идемпотентности. Значит уведомление не уходило НИКОГДА —
+    две из пяти новых возможностей были мертвы в бою, оставаясь зелёными в
+    тестах, потому что те гоняли прогон одной попыткой.
+    """
+    monkeypatch.setattr(run_daily, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(run_daily, "LOCK_PATH", tmp_path / "run.lock")
+    monkeypatch.setattr(run_daily, "LOG_PATH", tmp_path / "run_daily.log")
+
+    def collect_with_dead_source(now=None, stats=None, **k):
+        if stats is not None:
+            stats.update({"x": 60, "exa": 32, "github": 0})
+        return [{"url": "https://example.com/src", "title": "t"}]
+
+    monkeypatch.setattr(run_daily, "collect_candidates", collect_with_dead_source)
+    monkeypatch.setattr(run_daily, "curate_digest", lambda *a, **k: {
+        "blocks": [{"emoji": "🏗", "title": f"М{i}",
+                    "url": f"https://example.com/{i}",
+                    "benefit": "Что вам это даёт: польза."} for i in range(4)],
+        "radar": [], "degraded": False})
+    monkeypatch.setattr(run_daily, "send_telegram", lambda text, **k: {"message_id": 7})
+    notices = []
+    monkeypatch.setattr(run_daily, "send_alert", lambda text, **k: notices.append(text))
+    monkeypatch.setattr(run_daily, "init_sentry", lambda: False)
+
+    rc = run_daily.main(["--attempt", "1", "--attempts", "3",
+                         "--now", NOW.isoformat()])
+
+    assert rc == 0
+    assert any("github" in n for n in notices), \
+        "наблюдение задавлено подавлением алёртов о сбое"
+
+
 # --- 3. Тихая деградация источников -----------------------------------------
 
 def test_gather_reports_per_source_counts():
@@ -332,6 +388,32 @@ def test_prune_survives_unparsable_names(tmp_path):
 
 
 # --- 5. Протухание GitHub PAT ------------------------------------------------
+
+@pytest.mark.parametrize("raw, expected_utc_hour", [
+    ("2026-11-20 10:30:00 UTC", 10),
+    ("2026-11-20 10:30:00 +0200", 8),      # компактное смещение — реальный вид
+    ("2026-11-20 10:30:00 +02:00", 8),
+    ("2026-11-20T10:30:00Z", 10),
+    ("2026-11-20 10:30:00", 10),           # без зоны — считаем UTC
+])
+def test_github_expiry_formats(raw, expected_utc_hour):
+    """GitHub отдаёт срок минимум в двух видах, и не только в UTC.
+
+    Находка CodeRabbit на PR #7. Подстановка ' UTC' → '+00:00' покрывала лишь
+    один из них: при '+0200' перед смещением оставался пробел, разбор падал, и
+    проверка срока молча выключалась — именно у тех токенов, чей срок GitHub
+    сообщил не в UTC.
+    """
+    got = collect.parse_github_expiry(raw)
+
+    assert got is not None, f"не разобрано: {raw}"
+    assert got.astimezone(dt.timezone.utc).hour == expected_utc_hour
+
+
+def test_github_expiry_rejects_garbage():
+    """Мусор — это None, а не исключение: проверка служебная."""
+    assert collect.parse_github_expiry("послезавтра") is None
+
 
 def test_token_expiry_warns_in_advance(tmp_path, monkeypatch):
     """О сроке токена узнаём заранее, а не по молчанию источника."""

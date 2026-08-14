@@ -6,6 +6,7 @@
 """
 import json
 import logging
+import re
 import sys
 import time
 import urllib.parse
@@ -185,15 +186,38 @@ def github_token_expiry():
         raw = r.headers.get("github-authentication-token-expiration")
     if not raw:
         return None
-    # Формат заголовка — '2026-11-20 10:30:00 UTC' либо ISO; принимаем оба,
-    # потому что разбор чужого формата не должен решать судьбу проверки.
-    text = raw.strip().replace(" UTC", "+00:00")
+    return parse_github_expiry(raw)
+
+
+# GitHub отдаёт срок как минимум в двух видах: '2026-11-20 10:30:00 UTC' и
+# '2026-11-20 10:30:00 +0200'. Наивная подстановка ' UTC' → '+00:00' покрывала
+# только первый: во втором перед смещением остаётся пробел, `fromisoformat`
+# падает, и проверка молча выключалась ровно у тех токенов, срок которых
+# GitHub сообщил не в UTC (находка CodeRabbit на PR #7).
+_GH_EXPIRY = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})"
+    r"(?:\s*(?P<tz>UTC|Z|[+-]\d{2}:?\d{2}))?$")
+
+
+def parse_github_expiry(raw):
+    """Разобрать значение заголовка со сроком токена. None — если не вышло."""
+    m = _GH_EXPIRY.match(str(raw).strip())
+    if not m:
+        log.warning("срок GitHub-токена не разобран — проверка пропущена")
+        return None
+
+    tz = m.group("tz")
+    if tz in (None, "UTC", "Z"):
+        offset = "+00:00"
+    elif ":" in tz:
+        offset = tz
+    else:                                   # компактная форма '+0200'
+        offset = f"{tz[:3]}:{tz[3:]}"
     try:
-        parsed = datetime.fromisoformat(text)
+        return datetime.fromisoformat(f"{m.group('ts')}{offset}")
     except ValueError:
         log.warning("срок GitHub-токена не разобран — проверка пропущена")
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def collect_candidates(now=None, days=DEFAULT_WINDOW_DAYS, stats=None):
