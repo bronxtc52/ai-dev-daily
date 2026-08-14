@@ -1,0 +1,38 @@
+name: tests
+
+# Тесты — единственный автоматический контроль качества этого сервиса: он
+# работает под cron без человека, и регрессия обнаружилась бы утренним
+# молчанием, а не красным прогоном. До сих пор прогон был только ручным.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'      # та же версия, что в venv на mh-central
+
+      - name: Установить зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # Секретов в окружении нет намеренно: тесты обязаны проходить без
+      # Key Vault и без сети. Прогон, которому нужны боевые ключи, — это уже
+      # не тест, а выкат, и в CI ему делать нечего.
+      - name: Прогнать тесты
+        run: python -m pytest tests/ -q
