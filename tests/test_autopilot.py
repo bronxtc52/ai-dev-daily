@@ -116,6 +116,27 @@ def test_alert_falls_back_to_main_chat(monkeypatch, captured_calls):
     assert "chat_id=201374791" in captured_calls[-1]["body"]
 
 
+def test_partial_alert_config_does_not_mix_destinations(monkeypatch, captured_calls):
+    """Половина настройки хуже, чем никакой (находка Codex на PR #7, P2).
+
+    Два независимых fallback дают смешанный адресат: заданный алёрт-бот вместе
+    с чатом ДАЙДЖЕСТА опубликует внутреннюю аварию подписчикам — ровно та
+    утечка, ради предотвращения которой адресаты и разводились. Пара
+    «бот+чат» обязана разрешаться целиком: либо оба свои, либо оба общие.
+    """
+    _set_secrets(monkeypatch,
+                 TELEGRAM_BOT_TOKEN="channel-bot",
+                 TELEGRAM_ALERT_BOT_TOKEN="alert-bot",   # задан
+                 TELEGRAM_CHAT_ID="-1001234567890")      # а чата алёртов НЕТ
+
+    run_daily.send_alert("авария")
+
+    body = captured_calls[-1]["body"]
+    url = captured_calls[-1]["url"]
+    assert not ("/botalert-bot/" in url and "chat_id=-1001234567890" in body), \
+        "смешанный адресат: алёрт-бот пишет в публичный канал"
+
+
 def test_alert_can_use_separate_bot(monkeypatch, captured_calls):
     """Алёрт может идти другим ботом.
 
@@ -192,6 +213,35 @@ def test_single_attempt_is_final_by_default(failing_env):
     run_daily.main(["--now", NOW.isoformat()])
 
     assert alerts
+
+
+def test_sigterm_is_reported_like_a_failure(failing_env, monkeypatch):
+    """Снятие по SIGTERM обязано пройти обычным путём провала.
+
+    Находка Codex на PR #7 (P1). Внешний `timeout` шлёт процессу SIGTERM, и по
+    умолчанию Python на нём просто умирает: это не исключение, ветка `except`
+    в main() не выполняется, отметка `failure` не пишется и алёрт не уходит.
+    То есть зависание — единственный сценарий, ради которого timeout и ставился,
+    — оставалось молчаливым, а узнать о нём можно было бы только назавтра, по
+    протухшей отметке.
+    """
+    import os
+    import signal
+
+    tmp_path, alerts = failing_env
+
+    def hang_then_get_terminated(**k):
+        os.kill(os.getpid(), signal.SIGTERM)
+        return []                                   # сюда не дойдём
+
+    monkeypatch.setattr(run_daily, "collect_candidates", hang_then_get_terminated)
+
+    rc = run_daily.main(["--now", NOW.isoformat()])
+
+    assert rc == 1
+    assert alerts, "снятие по SIGTERM прошло молча"
+    hb = json.loads((tmp_path / "heartbeat.json").read_text())
+    assert hb["status"] == "failure"
 
 
 # --- 3. Тихая деградация источников -----------------------------------------

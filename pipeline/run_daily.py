@@ -16,6 +16,7 @@ import logging
 import os
 import pathlib
 import re
+import signal
 import socket
 import sys
 import time
@@ -67,17 +68,39 @@ def send_telegram(text, disable_preview=True):
 
 
 def _optional_secret(key, fallback_key):
-    """Значение `key`, а если он не настроен — значение `fallback_key`.
-
-    Отсутствие ключа здесь — штатная конфигурация, а не поломка: пока адресат
-    аварий отдельно не задан, всё работает как раньше. Иначе выкат новой версии
-    до правки cron уронил бы именно контур уведомлений — тот, что обязан
-    сообщать о поломках.
-    """
+    """Значение `key`, а если он не настроен — значение `fallback_key`."""
     try:
         return secret(key)
     except RuntimeError:
         return secret(fallback_key)
+
+
+def alert_destination():
+    """Куда слать аварии: пара (бот, чат).
+
+    Отсутствие настройки здесь — штатная конфигурация, а не поломка: пока
+    отдельный адресат не задан, всё работает как раньше. Иначе выкат новой
+    версии до правки окружения уронил бы именно контур уведомлений — тот, что
+    обязан сообщать о поломках.
+
+    ⚠️ Ключи НЕ разрешаются независимо друг от друга (находка Codex на PR #7).
+    Заданный алёрт-бот при незаданном алёрт-чате дал бы смешанный адресат:
+    отдельный бот пишет в чат ДАЙДЖЕСТА, то есть внутренняя авария уходит
+    подписчикам публичного канала — ровно та утечка, ради которой адресаты и
+    разводились.
+
+    Но и симметричное «оба или ни одного» неверно: половины здесь неравноценны.
+    Опасен только ЧАТ — он решает, кто прочтёт. Бот лишь доставляет, и
+    конфигурация «тот же бот, но в личку владельца» совершенно законна;
+    правило «оба или ничего» сломало бы её, вернув аварии в канал. Поэтому
+    решает чат: нет своего чата — вся пара общая, и заданный алёрт-бот
+    игнорируется как неполная настройка.
+    """
+    try:
+        chat = secret("TELEGRAM_ALERT_CHAT_ID")
+    except RuntimeError:
+        return secret("TELEGRAM_BOT_TOKEN"), secret("TELEGRAM_CHAT_ID")
+    return _optional_secret("TELEGRAM_ALERT_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"), chat
 
 
 def send_alert(text):
@@ -92,13 +115,40 @@ def send_alert(text):
     пока тот не нажал Start, — и без этой развилки контур уведомлений зависел
     бы от ручного действия человека.
     """
-    token = _optional_secret("TELEGRAM_ALERT_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
-    chat = _optional_secret("TELEGRAM_ALERT_CHAT_ID", "TELEGRAM_CHAT_ID")
+    token, chat = alert_destination()
     data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/sendMessage", data=data)
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)
+
+
+# ---------- снятие извне -----------------------------------------------------
+
+class Terminated(Exception):
+    """Прогон снят сигналом извне: внешний timeout, оператор, systemd."""
+
+
+def install_termination_handler():
+    """Превратить SIGTERM в обычное исключение.
+
+    Обёртка накрывает прогон внешним `timeout`, а тот на истечении шлёт именно
+    SIGTERM. По умолчанию Python на нём просто умирает: это не исключение,
+    ветка `except` в main() не выполняется, отметка `failure` не пишется и
+    алёрт не уходит. Получалось, что зависание — ЕДИНСТВЕННЫЙ сценарий, ради
+    которого timeout и ставился, — оставалось молчаливым, и узнать о нём можно
+    было бы лишь назавтра по протухшей отметке (находка Codex на PR #7).
+
+    Запаса времени хватает: `--kill-after=60s` даёт минуту на запись отметки и
+    доставку алёрта, прежде чем придёт неперехватываемый KILL.
+    """
+    def handler(signum, _frame):
+        raise Terminated(f"прогон снят сигналом {signal.Signals(signum).name}")
+
+    try:
+        return signal.signal(signal.SIGTERM, handler)
+    except ValueError:
+        return None                 # не главный поток; под cron не наш случай
 
 
 # ---------- Sentry -----------------------------------------------------------
@@ -817,6 +867,9 @@ def main(argv=None):
         h.addFilter(redactor)
 
     init_sentry()
+    # До первой сетевой работы: иначе снятие по таймауту на самом длинном шаге
+    # (курация) прошло бы мимо обработчика.
+    install_termination_handler()
 
     now = dt.datetime.fromisoformat(args.now) if args.now else None
     if now is not None and now.tzinfo is None:
